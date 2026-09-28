@@ -1,0 +1,288 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User profile and non-sensitive display preferences",
+      "type": "object",
+      "properties": {
+        "baseCurrency": {
+          "type": "string",
+          "description": "Base currency ISO code"
+        },
+        "themePreference": {
+          "type": "string",
+          "description": "User preferred theme: light or dark"
+        }
+      }
+    },
+    "Account": {
+      "title": "Account",
+      "description": "Bank account or canonical single Cash account with integer minor unit balances",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier of the account"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user ID"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name of the account",
+          "maxLength": 100
+        },
+        "type": {
+          "type": "string",
+          "description": "Account type: bank or cash",
+          "enum": ["bank", "cash"]
+        },
+        "institution": {
+          "type": "string",
+          "description": "Financial institution or cash custody label",
+          "maxLength": 100
+        },
+        "currency": {
+          "type": "string",
+          "description": "ISO 4217 3-letter currency code",
+          "maxLength": 3
+        },
+        "openingBalance": {
+          "type": "integer",
+          "description": "Opening balance in integer minor units (e.g. paise)"
+        },
+        "openingBalanceDate": {
+          "type": "string",
+          "description": "Effective opening balance ISO date (YYYY-MM-DD)"
+        },
+        "calculatedBalance": {
+          "type": "integer",
+          "description": "Computed balance including opening balance and adjustments in integer minor units"
+        },
+        "reportedBalance": {
+          "type": "integer",
+          "description": "Most recently reported external snapshot balance in integer minor units"
+        },
+        "lastReconciledAt": {
+          "type": "string",
+          "description": "ISO timestamp of last reconciliation operation"
+        },
+        "isActive": {
+          "type": "boolean",
+          "description": "Active or archived state of the account"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp when account was created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "ISO timestamp when account was last updated"
+        }
+      },
+      "required": ["id", "userId", "name", "type", "institution", "currency", "openingBalance", "openingBalanceDate", "calculatedBalance", "isActive", "createdAt", "updatedAt"]
+    },
+    "BalanceSnapshot": {
+      "title": "Balance Snapshot",
+      "description": "Reported external balance point-in-time snapshot for reconciliation",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique snapshot ID"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user ID"
+        },
+        "accountId": {
+          "type": "string",
+          "description": "Associated account identifier"
+        },
+        "snapshotDate": {
+          "type": "string",
+          "description": "Effective snapshot date (YYYY-MM-DD)"
+        },
+        "reportedBalance": {
+          "type": "integer",
+          "description": "Reported balance in integer minor units"
+        },
+        "source": {
+          "type": "string",
+          "description": "Source of reported balance (manual, statement, portal)"
+        },
+        "notes": {
+          "type": "string",
+          "description": "Auditor or user notes regarding the snapshot",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp when snapshot was captured"
+        }
+      },
+      "required": ["id", "userId", "accountId", "snapshotDate", "reportedBalance", "source", "createdAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Canonical transaction record in integer minor units",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "accountId": { "type": "string" },
+        "transactionDate": { "type": "string" },
+        "amount": { "type": "integer" },
+        "type": {
+          "type": "string",
+          "enum": [
+            "INCOME",
+            "EXPENSE",
+            "INTERNAL_TRANSFER",
+            "INVESTMENT_ALLOCATION",
+            "TAX",
+            "MONEY_LENT",
+            "RECEIVABLE_REPAYMENT",
+            "DEBT_BORROWING",
+            "DEBT_REPAYMENT",
+            "NON_FINANCIAL_ASSET_PURCHASE"
+          ]
+        },
+        "categoryId": { "type": ["string", "null"] },
+        "counterpartyId": { "type": ["string", "null"] },
+        "description": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" },
+        "status": { "type": "string", "enum": ["POSTED", "VOIDED"] },
+        "transferGroupId": { "type": ["string", "null"] },
+        "transferDirection": { "type": ["string", "null"], "enum": ["OUT", "IN", null] },
+        "recurringTemplateId": { "type": ["string", "null"] },
+        "allocations": { "type": "array" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "accountId", "transactionDate", "amount", "type", "description", "status", "createdAt", "updatedAt"]
+    },
+    "Category": {
+      "title": "Category",
+      "description": "User-scoped nested category for classifying transactions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "parentId": { "type": ["string", "null"] },
+        "type": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "isActive", "createdAt", "updatedAt"]
+    },
+    "Counterparty": {
+      "title": "Counterparty",
+      "description": "User-scoped counterparty or merchant associated with transactions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "notes": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "isActive", "createdAt", "updatedAt"]
+    },
+    "Tag": {
+      "title": "Tag",
+      "description": "User-scoped lightweight tag",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "name": { "type": "string" },
+        "color": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "isActive", "createdAt", "updatedAt"]
+    },
+    "AuditRecord": {
+      "title": "Audit Record",
+      "description": "Immutable server-generated audit record tracking financial mutations",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique audit record identifier"
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user identifier"
+        },
+        "actor": {
+          "type": "string",
+          "description": "User or system agent performing the operation"
+        },
+        "action": {
+          "type": "string",
+          "description": "Audit action type"
+        },
+        "entityType": {
+          "type": "string",
+          "description": "Target entity type"
+        },
+        "entityId": {
+          "type": "string",
+          "description": "Identifier of modified entity"
+        },
+        "details": {
+          "type": "object",
+          "description": "State transition or mutation payload details"
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "ISO timestamp of the audit entry"
+        }
+      },
+      "required": ["id", "userId", "actor", "action", "entityType", "entityId", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/profile/{doc}": {
+      "schema": "User",
+      "description": "User profile and UI preferences"
+    },
+    "/users/{userId}/accounts/{accountId}": {
+      "schema": "Account",
+      "description": "User bank and single canonical cash financial accounts"
+    },
+    "/users/{userId}/balanceSnapshots/{snapshotId}": {
+      "schema": "BalanceSnapshot",
+      "description": "User reported balance snapshots for balance reconciliation"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "User canonical financial transactions"
+    },
+    "/users/{userId}/categories/{categoryId}": {
+      "schema": "Category",
+      "description": "User customizable category tree"
+    },
+    "/users/{userId}/counterparties/{counterpartyId}": {
+      "schema": "Counterparty",
+      "description": "User counterparties and merchants"
+    },
+    "/users/{userId}/tags/{tagId}": {
+      "schema": "Tag",
+      "description": "User tags"
+    },
+    "/users/{userId}/audit/{auditId}": {
+      "schema": "AuditRecord",
+      "description": "User append-only financial audit log"
+    }
+  }
+}

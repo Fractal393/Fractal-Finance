@@ -1,0 +1,141 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isEmailVerified() {
+      return isAuthenticated() && request.auth.token.email_verified == true;
+    }
+
+    match /users/{userId} {
+      // Allow user document read if owner
+      allow read: if isOwner(userId);
+      allow write: if false;
+
+      // User profile & non-sensitive preferences
+      match /profile/{docId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // Security & PIN verifier: Completely inaccessible to client SDK
+      match /security/{docId} {
+        allow read, write: if false;
+      }
+
+      // Audit logs: Read-only for owner with verified email. Never client writable.
+      match /auditLogs/{auditId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /audit/{auditId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      // Canonical financial collections: Client read-only for verified owner.
+      // All mutations must go through the Node.js API with Admin SDK.
+      match /accounts/{accountId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /balanceSnapshots/{snapshotId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /transactions/{transactionId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+
+        match /allocations/{allocationId} {
+          allow read: if isOwner(userId) && isEmailVerified();
+          allow write: if false;
+        }
+      }
+
+      match /categories/{categoryId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /counterparties/{counterpartyId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /tags/{tagId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /recurringTransactions/{recurringId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /investments/{investmentId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+
+        match /valuations/{valuationId} {
+          allow read: if isOwner(userId) && isEmailVerified();
+          allow write: if false;
+        }
+      }
+
+      match /assets/{assetId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+
+        match /valuations/{valuationId} {
+          allow read: if isOwner(userId) && isEmailVerified();
+          allow write: if false;
+        }
+      }
+
+      match /debts/{debtId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+
+        match /payments/{paymentId} {
+          allow read: if isOwner(userId) && isEmailVerified();
+          allow write: if false;
+        }
+      }
+
+      match /taxRecords/{taxRecordId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
+      match /imports/{importId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+
+        match /importedTransactions/{rowId} {
+          allow read: if isOwner(userId) && isEmailVerified();
+          allow write: if false;
+        }
+      }
+
+      match /categorizationRules/{ruleId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+    }
+  }
+}

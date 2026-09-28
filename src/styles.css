@@ -1,0 +1,68 @@
+@import url('https://fonts.googleapis.com/icon?family=Material+Icons');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-editorial: 'Newsreader', Georgia, serif;
+}
+
+:root {
+  --color-canvas: #F4F1EA;
+  --color-surface: #FBFAF7;
+  --color-ink: #191B19;
+  --color-secondary: #6B6C66;
+  --color-border: #D9D6CE;
+  --color-accent: #285F5C;
+  --color-accent-hover: #1e4946;
+  --color-positive: #44785A;
+  --color-negative: #A6534B;
+  --color-warning: #A8752F;
+  --color-info: #55748C;
+}
+
+html.dark {
+  --color-canvas: #101311;
+  --color-surface: #171B18;
+  --color-ink: #F2F0E8;
+  --color-secondary: #A5AAA2;
+  --color-border: #303631;
+  --color-accent: #285F5C;
+  --color-accent-hover: #337571;
+  --color-positive: #44785A;
+  --color-negative: #A6534B;
+  --color-warning: #A8752F;
+  --color-info: #55748C;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.font-editorial {
+  font-family: var(--font-editorial);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom scrollbars matching theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
