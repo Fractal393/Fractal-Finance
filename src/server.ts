@@ -34,6 +34,10 @@ import {
   createTag,
   updateTag,
 } from './server/metadata-service.js';
+import {
+  getDashboardReport,
+  ReportingPeriodType,
+} from './server/reporting-service.js';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
@@ -504,6 +508,33 @@ app.put('/api/tags/:id', authenticateToken, requireVerifiedEmail, async (req: Au
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Failed to update tag';
     res.status(400).json({ error: 'TAG_UPDATE_FAILED', message });
+  }
+});
+
+// ==========================================
+// Slice 4: Dashboard & Reporting APIs
+// ==========================================
+
+/**
+ * GET /api/reports/dashboard: Canonical dashboard metrics and reporting aggregations.
+ */
+app.get('/api/reports/dashboard', authenticateToken, requireVerifiedEmail, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const period = (req.query['period'] as ReportingPeriodType) || 'current_month';
+    const startDate = req.query['startDate'] as string | undefined;
+    const endDate = req.query['endDate'] as string | undefined;
+    const fyStartMonth = req.query['fyStartMonth'] ? parseInt(req.query['fyStartMonth'] as string, 10) : 4;
+
+    const report = await getDashboardReport(req.user!.uid, {
+      period,
+      startDate,
+      endDate,
+      financialYearStartMonth: fyStartMonth,
+    });
+    res.json(report);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to generate dashboard report';
+    res.status(500).json({ error: 'DASHBOARD_REPORT_FAILED', message });
   }
 });
 

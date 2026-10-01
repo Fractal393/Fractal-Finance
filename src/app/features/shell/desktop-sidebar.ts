@@ -40,10 +40,10 @@ import { MatIconModule } from '@angular/material/icon';
 
       <!-- Footer system indicator -->
       <div class="p-4 border-t border-[var(--color-border)] text-xs text-[var(--color-secondary)] flex items-center justify-between">
-        <span class="font-mono text-[11px]">V1.0 • Slice 1</span>
+        <span class="font-mono text-[11px]">Financial OS</span>
         <span class="inline-flex items-center space-x-1 text-[var(--color-accent)] font-medium">
           <span class="w-1.5 h-1.5 rounded-full bg-[var(--color-positive)]"></span>
-          <span>Core Active</span>
+          <span>Ledger Synced</span>
         </span>
       </div>
     </aside>

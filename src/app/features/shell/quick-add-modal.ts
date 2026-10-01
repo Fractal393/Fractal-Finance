@@ -12,6 +12,7 @@ import { FormControl, FormGroup, ReactiveFormsModule, Validators } from '@angula
 import { MatIconModule } from '@angular/material/icon';
 import { TransactionState } from '../../core/transactions/transaction-state';
 import { AccountState } from '../../core/accounts/account-state';
+import { ReportingState } from '../../core/reporting/reporting-state';
 import {
   TransactionType,
   TRANSACTION_TYPE_LABELS,
@@ -396,6 +397,7 @@ export class QuickAddModal implements OnInit {
 
   readonly txState = inject(TransactionState);
   readonly accountState = inject(AccountState);
+  readonly reportingState = inject(ReportingState);
 
   readonly isSplit = signal<boolean>(false);
   readonly showMoreDetails = signal<boolean>(false);
@@ -573,6 +575,9 @@ export class QuickAddModal implements OnInit {
           allocations,
         });
       }
+
+      // Refresh dashboard reporting metrics
+      void this.reportingState.refresh();
 
       if (addAnother) {
         // Reset amount and description for next transaction

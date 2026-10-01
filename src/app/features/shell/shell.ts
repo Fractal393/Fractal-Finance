@@ -36,7 +36,7 @@ import { QuickAddService } from '../../core/transactions/quick-add.service';
             <span class="font-editorial text-base font-semibold text-[var(--color-ink)]">Fractal Finance</span>
           </div>
           <span class="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[var(--color-canvas)] border border-[var(--color-border)] text-[var(--color-secondary)]">
-            Slice 3
+            Active
           </span>
         </header>
 
