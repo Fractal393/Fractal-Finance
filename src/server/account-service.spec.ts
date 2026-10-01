@@ -6,6 +6,7 @@ import {
   getAccounts,
   reconcileAccount,
   getBalanceHistory,
+  recalculateAccountBalanceFromLedger,
   validateCreateAccountInput,
   CreateAccountInput,
 } from './account-service.js';
@@ -16,6 +17,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
   let mockStore: {
     accounts: Map<string, Record<string, unknown>>;
     snapshots: Map<string, Record<string, unknown>>;
+    transactions: Map<string, Record<string, unknown>>;
     audit: Map<string, Record<string, unknown>>;
   };
 
@@ -26,6 +28,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
     mockStore = {
       accounts: new Map(),
       snapshots: new Map(),
+      transactions: new Map(),
       audit: new Map(),
     };
 
@@ -41,6 +44,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
                 const getStore = () => {
                   if (subColName === 'accounts') return mockStore.accounts;
                   if (subColName === 'balanceSnapshots') return mockStore.snapshots;
+                  if (subColName === 'transactions') return mockStore.transactions;
                   if (subColName === 'audit') return mockStore.audit;
                   throw new Error(`Unexpected subcollection ${subColName}`);
                 };
@@ -478,8 +482,100 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
         difference: -20000,
         snapshotId: res.snapshot.id,
         snapshotDate: '2026-09-30',
+        adjustmentTransactionId: res.adjustmentTransaction!.id,
         notes: 'Cash drawer count adjustment',
       });
+
+      // Verify explicit ledger transaction was created
+      expect(res.adjustmentTransaction).toBeDefined();
+      expect(res.adjustmentTransaction?.type).toBe('RECONCILIATION_ADJUSTMENT');
+      expect(res.adjustmentTransaction?.amount).toBe(20000);
+      expect(res.adjustmentTransaction?.reconciliationDiscrepancy).toBe(-20000);
+      expect(res.adjustmentTransaction?.reconciliationId).toBe(res.snapshot.id);
+      expect(mockStore.transactions.get(`${USER_A}/${res.adjustmentTransaction!.id}`)).toBeDefined();
+    });
+
+    it('creates explicit reconciliation adjustment ledger events and retrieves history over time', async () => {
+      const account = await createAccount(USER_A, {
+        name: 'HDFC Current',
+        type: 'bank',
+        institution: 'HDFC',
+        currency: 'INR',
+        openingBalance: 500000, // ₹5,000.00
+        openingBalanceDate: '2026-08-01',
+      });
+
+      // Month 1 reconciliation (+₹1,000.00 interest received outside transactions)
+      const rec1 = await reconcileAccount(USER_A, account.id, {
+        reportedBalance: 600000, // ₹6,000.00
+        snapshotDate: '2026-08-31',
+        source: 'bank_statement',
+        notes: 'Interest adjustment',
+        applyAdjustment: true,
+      });
+
+      expect(rec1.difference).toBe(100000);
+      expect(rec1.adjustmentTransaction).toBeDefined();
+      expect(rec1.adjustmentTransaction?.amount).toBe(100000);
+      expect(rec1.adjustmentTransaction?.reconciliationDiscrepancy).toBe(100000);
+      expect(rec1.account.calculatedBalance).toBe(600000);
+
+      // Month 2 reconciliation (-₹250.00 bank charge outside transactions)
+      const rec2 = await reconcileAccount(USER_A, account.id, {
+        reportedBalance: 575000, // ₹5,750.00
+        snapshotDate: '2026-09-30',
+        source: 'bank_statement',
+        notes: 'Bank service charge',
+        applyAdjustment: true,
+      });
+
+      expect(rec2.difference).toBe(-25000);
+      expect(rec2.adjustmentTransaction?.amount).toBe(25000);
+      expect(rec2.adjustmentTransaction?.reconciliationDiscrepancy).toBe(-25000);
+      expect(rec2.account.calculatedBalance).toBe(575000);
+
+      // History retrieval
+      const history = await getBalanceHistory(USER_A, account.id);
+      expect(history.length).toBe(2);
+      expect(history[0].snapshotDate).toBe('2026-09-30');
+      expect(history[1].snapshotDate).toBe('2026-08-31');
+
+      // Verify account-balance derivation normalization around ledger
+      const recalculated = await recalculateAccountBalanceFromLedger(USER_A, account.id);
+      expect(recalculated.derivedBalance).toBe(575000);
+      expect(recalculated.account.calculatedBalance).toBe(575000);
+    });
+
+    it('updates calculatedBalance and preserves ledger normalization when openingBalance is edited', async () => {
+      const account = await createAccount(USER_A, {
+        name: 'SBI Savings',
+        type: 'bank',
+        institution: 'SBI',
+        currency: 'INR',
+        openingBalance: 200000, // ₹2,000.00
+        openingBalanceDate: '2026-01-01',
+      });
+
+      expect(account.calculatedBalance).toBe(200000);
+
+      // User updates opening balance to ₹3,500.00 (+₹1,500.00 / 150,000 paise)
+      const updated = await updateAccount(USER_A, account.id, {
+        openingBalance: 350000,
+      });
+
+      expect(updated.openingBalance).toBe(350000);
+      expect(updated.calculatedBalance).toBe(350000);
+
+      // Audit recorded
+      const auditEntries = Array.from(mockStore.audit.values());
+      const openingAudit = auditEntries.find((e) => e['action'] === 'OPENING_BALANCE_CHANGED');
+      expect(openingAudit).toBeDefined();
+      expect(openingAudit!['details']['previous']['openingBalance']).toBe(200000);
+      expect(openingAudit!['details']['updated']['openingBalance']).toBe(350000);
+
+      // Ledger normalization matches
+      const recalculated = await recalculateAccountBalanceFromLedger(USER_A, account.id);
+      expect(recalculated.derivedBalance).toBe(350000);
     });
   });
 });

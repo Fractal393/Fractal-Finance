@@ -61,6 +61,7 @@ export interface ReconcileResult {
   reportedBalance: number;
   difference: number;
   adjustmentApplied: boolean;
+  adjustmentTransaction?: unknown | null;
 }
 
 /**

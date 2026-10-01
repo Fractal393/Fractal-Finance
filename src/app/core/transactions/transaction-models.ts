@@ -8,7 +8,8 @@ export type TransactionType =
   | 'RECEIVABLE_REPAYMENT'
   | 'DEBT_BORROWING'
   | 'DEBT_REPAYMENT'
-  | 'NON_FINANCIAL_ASSET_PURCHASE';
+  | 'NON_FINANCIAL_ASSET_PURCHASE'
+  | 'RECONCILIATION_ADJUSTMENT';
 
 export type TransactionStatus = 'POSTED' | 'VOIDED';
 
@@ -40,6 +41,9 @@ export interface Transaction {
   transferDirection?: TransferDirection | null;
   destinationAccountId?: string | null;
   recurringTemplateId?: string | null;
+  reconciliationId?: string | null;
+  reconciliationDiscrepancy?: number | null;
+  categoryIds?: string[];
   allocations: SplitAllocation[];
   idempotencyKey?: string | null;
   createdAt: string;
@@ -157,4 +161,5 @@ export const TRANSACTION_TYPE_LABELS: Record<TransactionType, { label: string; i
   DEBT_BORROWING: { label: 'Debt Borrowing', icon: 'credit_card', cashImpact: '+ Cash' },
   DEBT_REPAYMENT: { label: 'Debt Repayment', icon: 'price_check', cashImpact: '- Cash' },
   NON_FINANCIAL_ASSET_PURCHASE: { label: 'Asset Acquisition', icon: 'domain', cashImpact: '- Cash' },
+  RECONCILIATION_ADJUSTMENT: { label: 'Reconciliation Adj.', icon: 'tune', cashImpact: 'Adjustment' },
 };

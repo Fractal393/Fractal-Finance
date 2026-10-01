@@ -34,6 +34,9 @@ export interface TransactionDocument {
   transferDirection?: TransferDirection | null;
   destinationAccountId?: string | null;
   recurringTemplateId?: string | null;
+  reconciliationId?: string | null;
+  reconciliationDiscrepancy?: number | null;
+  categoryIds?: string[];
   allocations: SplitAllocation[];
   idempotencyKey?: string | null;
   createdAt: string;
@@ -597,6 +600,94 @@ export async function updateTransaction(
     allocationsChanged = true;
   }
 
+  // If part of an internal transfer group, edit both legs and balances atomically
+  if (current.transferGroupId) {
+    if (input.type !== undefined && input.type !== 'INTERNAL_TRANSFER') {
+      throw new Error('Cannot change type of an internal transfer leg.');
+    }
+    if (input.allocations !== undefined && input.allocations.length > 0) {
+      throw new Error('Internal transfers cannot have split allocations.');
+    }
+
+    const pairSnap = await db
+      .collection('users')
+      .doc(userId)
+      .collection('transactions')
+      .where('transferGroupId', '==', current.transferGroupId)
+      .get();
+
+    const pairDocs = pairSnap.docs.map((d) => d.data() as TransactionDocument);
+    const sourceTx = pairDocs.find((d) => d.transferDirection === 'OUT') || (current.transferDirection === 'OUT' ? current : null);
+    const destTx = pairDocs.find((d) => d.transferDirection === 'IN') || (current.transferDirection === 'IN' ? current : null);
+
+    if (!sourceTx || !destTx) {
+      throw new Error('Associated transfer leg not found.');
+    }
+
+    const oldAmount = sourceTx.amount;
+    const amountDiff = newAmount - oldAmount;
+
+    const sourceRef = db.collection('users').doc(userId).collection('transactions').doc(sourceTx.id);
+    const destRef = db.collection('users').doc(userId).collection('transactions').doc(destTx.id);
+
+    const sourceAccRef = db.collection('users').doc(userId).collection('accounts').doc(sourceTx.accountId);
+    const destAccRef = db.collection('users').doc(userId).collection('accounts').doc(destTx.accountId);
+
+    await db.runTransaction(async (transaction) => {
+      if (amountDiff !== 0) {
+        const sSnap = await transaction.get(sourceAccRef);
+        const dSnap = await transaction.get(destAccRef);
+
+        if (sSnap.exists) {
+          const sAcc = sSnap.data() as AccountDocument;
+          transaction.update(sourceAccRef, {
+            calculatedBalance: (sAcc.calculatedBalance || 0) - amountDiff,
+            updatedAt: updates.updatedAt,
+          });
+        }
+        if (dSnap.exists) {
+          const dAcc = dSnap.data() as AccountDocument;
+          transaction.update(destAccRef, {
+            calculatedBalance: (dAcc.calculatedBalance || 0) + amountDiff,
+            updatedAt: updates.updatedAt,
+          });
+        }
+      }
+
+      const commonUpdates: Partial<TransactionDocument> = {
+        amount: newAmount,
+        updatedAt: updates.updatedAt,
+      };
+      if (updates.transactionDate) commonUpdates.transactionDate = updates.transactionDate;
+      if (updates.notes !== undefined) commonUpdates.notes = updates.notes;
+      if (updates.tags !== undefined) commonUpdates.tags = updates.tags;
+
+      transaction.update(sourceRef, commonUpdates);
+      transaction.update(destRef, commonUpdates);
+    });
+
+    await createAuditRecord({
+      userId,
+      actor: userId,
+      action: 'TRANSFER_EDITED',
+      entityType: 'transfer',
+      entityId: current.transferGroupId,
+      details: {
+        previousAmount: oldAmount,
+        updatedAmount: newAmount,
+        amountDifference: amountDiff,
+        sourceAccountId: sourceTx.accountId,
+        destinationAccountId: destTx.accountId,
+      },
+    });
+
+    return {
+      ...current,
+      ...updates,
+      amount: newAmount,
+    };
+  }
+
   // Calculate balance change difference
   const oldDelta = getTransactionBalanceDelta(current.type, current.amount, current.status, current.transferDirection);
   const newDelta = getTransactionBalanceDelta(newType, newAmount, 'POSTED', current.transferDirection);
@@ -812,73 +903,68 @@ export async function getTransactions(
   if (!db) throw new Error('Firestore not initialized');
 
   const col = db.collection('users').doc(userId).collection('transactions');
-  const snap = await col.get();
+  let query: FirebaseFirestore.Query = col;
 
-  let items: TransactionDocument[] = [];
-  snap.forEach((doc) => {
-    items.push(doc.data() as TransactionDocument);
-  });
-
-  // Client / in-memory filtering for query precision without blowing composite index creation
   if (params.accountId) {
-    items = items.filter((t) => t.accountId === params.accountId);
+    query = query.where('accountId', '==', params.accountId);
   }
   if (params.type) {
-    items = items.filter((t) => t.type === params.type);
-  }
-  if (params.categoryId) {
-    items = items.filter(
-      (t) => t.categoryId === params.categoryId || t.allocations?.some((a) => a.categoryId === params.categoryId)
-    );
-  }
-  if (params.counterpartyId) {
-    items = items.filter((t) => t.counterpartyId === params.counterpartyId);
-  }
-  if (params.tag) {
-    const normalizedTag = params.tag.toLowerCase();
-    items = items.filter((t) => t.tags?.includes(normalizedTag) || t.allocations?.some((a) => a.tags?.includes(normalizedTag)));
+    query = query.where('type', '==', params.type);
   }
   if (params.status && params.status !== 'ALL') {
-    items = items.filter((t) => t.status === params.status);
+    query = query.where('status', '==', params.status);
+  }
+  if (params.counterpartyId) {
+    query = query.where('counterpartyId', '==', params.counterpartyId);
+  }
+  if (params.categoryId) {
+    query = query.where('categoryId', '==', params.categoryId);
+  }
+  if (params.tag) {
+    const normalizedTag = params.tag.trim().toLowerCase();
+    query = query.where('tags', 'array-contains', normalizedTag);
   }
   if (params.startDate) {
-    items = items.filter((t) => t.transactionDate >= params.startDate!);
+    query = query.where('transactionDate', '>=', params.startDate);
   }
   if (params.endDate) {
-    items = items.filter((t) => t.transactionDate <= params.endDate!);
+    query = query.where('transactionDate', '<=', params.endDate);
   }
+
+  // Order descending by transactionDate, then by id for deterministic cursor pagination
+  query = query.orderBy('transactionDate', 'desc').orderBy('id', 'desc');
+
+  const limit = Math.min(Math.max(params.limit || 25, 1), 100);
+
+  if (params.cursor) {
+    const cursorRef = col.doc(params.cursor);
+    const cursorSnap = await cursorRef.get();
+    if (cursorSnap.exists) {
+      query = query.startAfter(cursorSnap);
+    }
+  }
+
+  query = query.limit(limit + 1);
+  const snap = await query.get();
+
+  const docs = snap.docs;
+  const hasMore = docs.length > limit;
+  const pageDocs = hasMore ? docs.slice(0, limit) : docs;
+  let items: TransactionDocument[] = pageDocs.map((doc) => doc.data() as TransactionDocument);
+
   if (params.search && params.search.trim().length > 0) {
     const q = params.search.trim().toLowerCase();
     items = items.filter(
       (t) =>
         t.description.toLowerCase().includes(q) ||
-        (t.notes && t.notes.toLowerCase().includes(q))
+        (t.notes && t.notes.toLowerCase().includes(q)),
     );
   }
 
-  // Sort descending by transactionDate, then by createdAt
-  items.sort((a, b) => {
-    const dateComp = b.transactionDate.localeCompare(a.transactionDate);
-    if (dateComp !== 0) return dateComp;
-    return b.createdAt.localeCompare(a.createdAt);
-  });
-
-  const limit = Math.min(Math.max(params.limit || 25, 1), 100);
-  let startIndex = 0;
-
-  if (params.cursor) {
-    const cursorIdx = items.findIndex((t) => t.id === params.cursor);
-    if (cursorIdx !== -1) {
-      startIndex = cursorIdx + 1;
-    }
-  }
-
-  const pagedItems = items.slice(startIndex, startIndex + limit);
-  const hasMore = startIndex + limit < items.length;
-  const nextCursor = hasMore && pagedItems.length > 0 ? pagedItems[pagedItems.length - 1].id : null;
+  const nextCursor = hasMore && pageDocs.length > 0 ? pageDocs[pageDocs.length - 1].id : null;
 
   return {
-    items: pagedItems,
+    items,
     nextCursor,
     hasMore,
   };

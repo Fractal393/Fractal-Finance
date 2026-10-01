@@ -146,7 +146,8 @@
             "RECEIVABLE_REPAYMENT",
             "DEBT_BORROWING",
             "DEBT_REPAYMENT",
-            "NON_FINANCIAL_ASSET_PURCHASE"
+            "NON_FINANCIAL_ASSET_PURCHASE",
+            "RECONCILIATION_ADJUSTMENT"
           ]
         },
         "categoryId": { "type": ["string", "null"] },
@@ -157,6 +158,10 @@
         "status": { "type": "string", "enum": ["POSTED", "VOIDED"] },
         "transferGroupId": { "type": ["string", "null"] },
         "transferDirection": { "type": ["string", "null"], "enum": ["OUT", "IN", null] },
+        "destinationAccountId": { "type": ["string", "null"] },
+        "reconciliationId": { "type": ["string", "null"] },
+        "reconciliationDiscrepancy": { "type": ["number", "null"] },
+        "categoryIds": { "type": "array", "items": { "type": "string" } },
         "recurringTemplateId": { "type": ["string", "null"] },
         "allocations": { "type": "array" },
         "createdAt": { "type": "string" },

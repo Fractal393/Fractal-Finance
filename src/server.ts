@@ -1,11 +1,10 @@
 import {
-  AngularNodeAppEngine,
   createNodeRequestHandler,
   isMainModule,
-  writeResponseToNodeResponse,
 } from '@angular/ssr/node';
 import express, { Request, Response } from 'express';
 import { join } from 'node:path';
+import { existsSync } from 'node:fs';
 import { authenticateToken, requireVerifiedEmail, AuthenticatedRequest } from './server/auth-middleware.js';
 import { getPinStatus, setPinVerifier, verifyUserPin } from './server/pin-service.js';
 import { getFirebaseAdmin } from './server/firebase-admin.js';
@@ -16,6 +15,7 @@ import {
   getAccount,
   reconcileAccount,
   getBalanceHistory,
+  recalculateAccountBalanceFromLedger,
 } from './server/account-service.js';
 import {
   createTransaction,
@@ -248,6 +248,29 @@ app.get('/api/accounts/:id/balance-history', authenticateToken, requireVerifiedE
     }
     const message = err instanceof Error ? err.message : 'Failed to fetch balance history';
     res.status(500).json({ error: 'BALANCE_HISTORY_FAILED', message });
+  }
+});
+
+/**
+ * POST /api/accounts/:id/recalculate: Normalize account balance strictly around ledger transactions.
+ */
+app.post('/api/accounts/:id/recalculate', authenticateToken, requireVerifiedEmail, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const accountId = req.params['id'] as string;
+    const result = await recalculateAccountBalanceFromLedger(req.user!.uid, accountId);
+    res.json(result);
+  } catch (err: unknown) {
+    const errorObj = err as { code?: string; message?: string };
+    if (errorObj.code === 'ACCOUNT_NOT_FOUND') {
+      res.status(404).json({ error: 'ACCOUNT_NOT_FOUND', message: errorObj.message });
+      return;
+    }
+    if (errorObj.code === 'ACCESS_DENIED') {
+      res.status(403).json({ error: 'ACCESS_DENIED', message: errorObj.message });
+      return;
+    }
+    const message = err instanceof Error ? err.message : 'Failed to recalculate balance';
+    res.status(400).json({ error: 'RECALCULATE_FAILED', message });
   }
 });
 
@@ -498,10 +521,8 @@ app.use(
   }),
 );
 
-const angularApp = new AngularNodeAppEngine();
-
 /**
- * Handle all other non-API routes by delegating to the Angular client SPA
+ * Handle all other non-API routes by serving the client SPA index.html
  */
 app.use((req, res, next) => {
   if (req.path.startsWith('/api')) {
@@ -509,12 +530,12 @@ app.use((req, res, next) => {
     return;
   }
 
-  angularApp
-    .handle(req)
-    .then((response) =>
-      response ? writeResponseToNodeResponse(response, res) : next(),
-    )
-    .catch(next);
+  const indexPath = join(browserDistFolder, 'index.html');
+  if (existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    next();
+  }
 });
 
 /**

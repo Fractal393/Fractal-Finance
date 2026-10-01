@@ -8,7 +8,8 @@ export type TransactionType =
   | 'RECEIVABLE_REPAYMENT'
   | 'DEBT_BORROWING'
   | 'DEBT_REPAYMENT'
-  | 'NON_FINANCIAL_ASSET_PURCHASE';
+  | 'NON_FINANCIAL_ASSET_PURCHASE'
+  | 'RECONCILIATION_ADJUSTMENT';
 
 export type TransactionStatus = 'POSTED' | 'VOIDED';
 
@@ -196,6 +197,22 @@ export function classifyTransaction(
         accountCashFlowSign: -1,
       };
 
+    case 'RECONCILIATION_ADJUSTMENT':
+      // Reconciliation adjustment ledger event. Cash impact matches the adjustment amount's sign.
+      return {
+        isIncome: false,
+        isOrdinaryExpense: false,
+        isTotalExpense: false,
+        isConsumptionExpense: false,
+        isTax: false,
+        isTransfer: false,
+        isInvestmentAllocation: false,
+        isReceivableMovement: false,
+        isDebtMovement: false,
+        isAssetPurchase: false,
+        accountCashFlowSign: 1, // Uses raw signed amount directly
+      };
+
     default: {
       const _exhaustiveCheck: never = type;
       throw new Error(`Unhandled transaction type: ${_exhaustiveCheck}`);
@@ -208,15 +225,23 @@ export function classifyTransaction(
  * Returns signed integer minor units (paise).
  * E.g., for an EXPENSE of 50000, returns -50000.
  * For an INCOME of 100000, returns +100000.
+ * For a RECONCILIATION_ADJUSTMENT, returns the signed amount directly.
  */
 export function getTransactionBalanceDelta(
   type: TransactionType,
   amount: number,
   status: TransactionStatus,
   transferDirection?: TransferDirection | null,
+  reconciliationDiscrepancy?: number | null,
 ): number {
   if (status === 'VOIDED') {
     return 0;
+  }
+  if (type === 'RECONCILIATION_ADJUSTMENT') {
+    if (reconciliationDiscrepancy !== undefined && reconciliationDiscrepancy !== null) {
+      return reconciliationDiscrepancy;
+    }
+    return amount;
   }
   const { accountCashFlowSign } = classifyTransaction(type, transferDirection);
   return accountCashFlowSign * Math.abs(amount);

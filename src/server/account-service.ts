@@ -1,5 +1,7 @@
 import { getFirebaseAdmin } from './firebase-admin.js';
 import { createAuditRecord } from './audit-service.js';
+import type { TransactionDocument } from './transaction-service.js';
+import { getTransactionBalanceDelta } from './reporting-semantics.js';
 
 export type AccountType = 'bank' | 'cash';
 
@@ -64,6 +66,7 @@ export interface ReconcileResult {
   reportedBalance: number;
   difference: number;
   adjustmentApplied: boolean;
+  adjustmentTransaction?: TransactionDocument | null;
 }
 
 function validateISODate(dateStr: string): boolean {
@@ -454,8 +457,36 @@ export async function reconcileAccount(
       updatedAt: now,
     };
 
+    let adjustmentTx: TransactionDocument | null = null;
     if (applyAdjustment && difference !== 0) {
-      accountUpdates.calculatedBalance = input.reportedBalance;
+      const txCol = db.collection('users').doc(userId).collection('transactions');
+      const txRef = txCol.doc();
+      const isPositive = difference > 0;
+      const desc = input.notes?.trim() || `Reconciliation adjustment (${isPositive ? '+' : ''}${difference / 100})`;
+
+      adjustmentTx = {
+        id: txRef.id,
+        userId,
+        accountId,
+        transactionDate: input.snapshotDate.split('T')[0],
+        amount: Math.abs(difference),
+        type: 'RECONCILIATION_ADJUSTMENT',
+        reconciliationDiscrepancy: difference,
+        reconciliationId: snapshotRef.id,
+        categoryId: null,
+        counterpartyId: null,
+        description: desc,
+        tags: ['reconciliation'],
+        notes: `System-generated reconciliation adjustment against reported balance ${input.reportedBalance} (delta: ${difference > 0 ? '+' : ''}${difference})`,
+        status: 'POSTED',
+        transferGroupId: null,
+        allocations: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      transaction.set(txRef, adjustmentTx);
+      accountUpdates.calculatedBalance = currentCalculated + difference;
     }
 
     transaction.update(accountRef, accountUpdates);
@@ -472,6 +503,7 @@ export async function reconcileAccount(
       reportedBalance: input.reportedBalance,
       difference,
       adjustmentApplied: applyAdjustment && difference !== 0,
+      adjustmentTransaction: adjustmentTx,
     };
   }).then(async (result) => {
     // Audit after atomic transaction commit
@@ -488,6 +520,7 @@ export async function reconcileAccount(
           difference: result.difference,
           snapshotId: result.snapshot.id,
           snapshotDate: result.snapshot.snapshotDate,
+          adjustmentTransactionId: result.adjustmentTransaction?.id || null,
           notes: result.snapshot.notes,
         },
       });
@@ -546,4 +579,88 @@ export async function getBalanceHistory(
     if (dateComp !== 0) return dateComp;
     return b.createdAt.localeCompare(a.createdAt);
   });
+}
+
+/**
+ * Normalizes and derives account calculated balance strictly around the ledger.
+ * Sums: account.openingBalance + sum(all POSTED transactions for this account).
+ * If there is any discrepancy, updates account.calculatedBalance.
+ */
+export async function recalculateAccountBalanceFromLedger(
+  userId: string,
+  accountId: string,
+): Promise<{ account: AccountDocument; derivedBalance: number; previousCalculatedBalance: number }> {
+  const { db } = getFirebaseAdmin();
+  if (!db) {
+    throw new Error('Firestore database is not initialized on the server.');
+  }
+
+  const accountRef = db.collection('users').doc(userId).collection('accounts').doc(accountId);
+  const snap = await accountRef.get();
+  if (!snap.exists) {
+    const err = new Error(`Account ${accountId} not found.`);
+    (err as unknown as { code: string }).code = 'ACCOUNT_NOT_FOUND';
+    throw err;
+  }
+
+  const account = snap.data() as AccountDocument;
+  if (account.userId !== userId) {
+    const err = new Error('Access denied to account.');
+    (err as unknown as { code: string }).code = 'ACCESS_DENIED';
+    throw err;
+  }
+
+  // Fetch all transactions for this account
+  const txSnap = await db
+    .collection('users')
+    .doc(userId)
+    .collection('transactions')
+    .where('accountId', '==', accountId)
+    .get();
+
+  let ledgerSum = 0;
+  txSnap.forEach((doc) => {
+    const tx = doc.data() as TransactionDocument;
+    if (tx.status === 'POSTED') {
+      ledgerSum += getTransactionBalanceDelta(
+        tx.type,
+        tx.amount,
+        tx.status,
+        tx.transferDirection,
+        tx.reconciliationDiscrepancy,
+      );
+    }
+  });
+
+  const derivedBalance = account.openingBalance + ledgerSum;
+  const previousCalculatedBalance = account.calculatedBalance;
+
+  if (derivedBalance !== previousCalculatedBalance) {
+    const now = new Date().toISOString();
+    await accountRef.update({
+      calculatedBalance: derivedBalance,
+      updatedAt: now,
+    });
+    account.calculatedBalance = derivedBalance;
+    account.updatedAt = now;
+
+    await createAuditRecord({
+      userId,
+      actor: userId,
+      action: 'ACCOUNT_BALANCE_RECALCULATED',
+      entityType: 'account',
+      entityId: accountId,
+      details: {
+        previousCalculatedBalance,
+        derivedBalance,
+        ledgerTransactionsCount: txSnap.docs.length,
+      },
+    });
+  }
+
+  return {
+    account,
+    derivedBalance,
+    previousCalculatedBalance,
+  };
 }

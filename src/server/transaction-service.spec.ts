@@ -54,6 +54,108 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                   throw new Error(`Unexpected subcollection ${subColName}`);
                 };
 
+                interface MockFilter {
+                  field: string;
+                  op: string;
+                  val: unknown;
+                }
+                interface MockOrder {
+                  field: string;
+                  dir: 'asc' | 'desc';
+                }
+
+                const createMockQuery = (
+                  filters: MockFilter[] = [],
+                  orders: MockOrder[] = [],
+                  limitCount: number | null = null,
+                  startAfterId: string | null = null,
+                ): {
+                  where: (field: string, op: string, val: unknown) => ReturnType<typeof createMockQuery>;
+                  orderBy: (field: string, dir?: 'asc' | 'desc') => ReturnType<typeof createMockQuery>;
+                  startAfter: (docSnap: { id: string } | string) => ReturnType<typeof createMockQuery>;
+                  limit: (n: number) => ReturnType<typeof createMockQuery>;
+                  get: () => Promise<{
+                    empty: boolean;
+                    docs: { id: string; data: () => Record<string, unknown> }[];
+                    forEach: (cb: (doc: { id: string; data: () => Record<string, unknown> }) => void) => void;
+                  }>;
+                } => {
+                  const queryObj = {
+                    where: (field: string, op: string, val: unknown) => {
+                      return createMockQuery([...filters, { field, op, val }], orders, limitCount, startAfterId);
+                    },
+                    orderBy: (field: string, dir: 'asc' | 'desc' = 'asc') => {
+                      return createMockQuery(filters, [...orders, { field, dir }], limitCount, startAfterId);
+                    },
+                    startAfter: (docSnap: { id: string } | string) => {
+                      const id = typeof docSnap === 'string' ? docSnap : docSnap.id;
+                      return createMockQuery(filters, orders, limitCount, id);
+                    },
+                    limit: (n: number) => {
+                      return createMockQuery(filters, orders, n, startAfterId);
+                    },
+                    get: async () => {
+                      let allDocs: { id: string; data: () => Record<string, unknown> }[] = [];
+                      for (const [key, docData] of getStore().entries()) {
+                        if (!key.startsWith(`${userId}/`)) continue;
+
+                        let matches = true;
+                        for (const f of filters) {
+                          if (f.op === '==') {
+                            if (docData[f.field] !== f.val) { matches = false; break; }
+                          } else if (f.op === '>=') {
+                            if (!((docData[f.field] as string) >= (f.val as string))) { matches = false; break; }
+                          } else if (f.op === '<=') {
+                            if (!((docData[f.field] as string) <= (f.val as string))) { matches = false; break; }
+                          } else if (f.op === 'array-contains') {
+                            const arr = (docData[f.field] as unknown[]) || [];
+                            if (!arr.includes(f.val)) { matches = false; break; }
+                          }
+                        }
+                        if (matches) {
+                          allDocs.push({ id: docData['id'] as string, data: () => docData });
+                        }
+                      }
+
+                      if (orders.length > 0) {
+                        allDocs.sort((a, b) => {
+                          const aData = a.data();
+                          const bData = b.data();
+                          for (const o of orders) {
+                            const aVal = String(aData[o.field] ?? '');
+                            const bVal = String(bData[o.field] ?? '');
+                            const comp = o.dir === 'desc' ? bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+                            if (comp !== 0) return comp;
+                          }
+                          return 0;
+                        });
+                      }
+
+                      if (startAfterId) {
+                        const idx = allDocs.findIndex((d) => d.id === startAfterId);
+                        if (idx !== -1) {
+                          allDocs = allDocs.slice(idx + 1);
+                        }
+                      }
+
+                      if (limitCount !== null) {
+                        allDocs = allDocs.slice(0, limitCount);
+                      }
+
+                      return {
+                        empty: allDocs.length === 0,
+                        docs: allDocs,
+                        forEach: (cb: (doc: { id: string; data: () => Record<string, unknown> }) => void) => {
+                          allDocs.forEach((d) => cb(d));
+                        },
+                      };
+                    },
+                  };
+                  return queryObj;
+                };
+
+                const baseQuery = createMockQuery();
+
                 return {
                   doc: (docId?: string) => {
                     const id = docId || `doc_${docIdCounter++}`;
@@ -62,6 +164,7 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                       get: async () => {
                         const data = getStore().get(`${userId}/${id}`);
                         return {
+                          id,
                           exists: !!data,
                           data: () => data,
                         };
@@ -75,61 +178,11 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                       },
                     };
                   },
-                  where: (field: string, op: string, val: unknown) => {
-                    return {
-                      limit: (n: number) => ({
-                        get: async () => {
-                          const allDocs: { id: string; data: () => Record<string, unknown> }[] = [];
-                          for (const [key, docData] of getStore().entries()) {
-                            if (key.startsWith(`${userId}/`) && docData[field] === val) {
-                              allDocs.push({
-                                id: docData['id'] as string,
-                                data: () => docData,
-                              });
-                              if (allDocs.length >= n) break;
-                            }
-                          }
-                          return {
-                            empty: allDocs.length === 0,
-                            docs: allDocs,
-                          };
-                        },
-                      }),
-                      get: async () => {
-                        const allDocs: { id: string; data: () => Record<string, unknown> }[] = [];
-                        for (const [key, docData] of getStore().entries()) {
-                          if (key.startsWith(`${userId}/`) && docData[field] === val) {
-                            allDocs.push({
-                              id: docData['id'] as string,
-                              data: () => docData,
-                            });
-                          }
-                        }
-                        return {
-                          empty: allDocs.length === 0,
-                          docs: allDocs,
-                        };
-                      },
-                    };
-                  },
-                  get: async () => {
-                    const allDocs: { id: string; data: () => Record<string, unknown> }[] = [];
-                    for (const [key, docData] of getStore().entries()) {
-                      if (key.startsWith(`${userId}/`)) {
-                        allDocs.push({
-                          id: docData['id'] as string,
-                          data: () => docData,
-                        });
-                      }
-                    }
-                    return {
-                      empty: allDocs.length === 0,
-                      forEach: (cb: (doc: { data: () => Record<string, unknown> }) => void) => {
-                        allDocs.forEach((d) => cb(d));
-                      },
-                      docs: allDocs,
-                    };
-                  },
+                  where: baseQuery.where,
+                  orderBy: baseQuery.orderBy,
+                  startAfter: baseQuery.startAfter,
+                  limit: baseQuery.limit,
+                  get: baseQuery.get,
                 };
               },
             }),
@@ -605,6 +658,262 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
       const incomeList = await getTransactions(USER_A, { type: 'INCOME' });
       expect(incomeList.items.length).toBe(1);
       expect(incomeList.items[0].description).toBe('Salary Bonus');
+    });
+  });
+
+  describe('Slice 3.1 Hardening: Transfer Edit Invariants', () => {
+    it('atomically updates both legs and account balances when transfer amount is edited', async () => {
+      // Checking starts at 1,000,000; Savings starts at 5,000,000
+      const transfer = await createInternalTransfer(USER_A, {
+        sourceAccountId: 'acc_checking',
+        destinationAccountId: 'acc_savings',
+        amount: 100000, // ₹1,000.00
+        transactionDate: '2026-03-01',
+        description: 'Monthly savings sweep',
+      });
+
+      // Checking: 900,000 | Savings: 5,100,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(900000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5100000);
+
+      // Edit transfer amount to ₹1,500.00 (150,000 paise) via the source leg
+      const updatedSource = await updateTransaction(USER_A, transfer.sourceTransaction.id, {
+        amount: 150000,
+        notes: 'Increased sweep',
+      });
+
+      expect(updatedSource.amount).toBe(150000);
+
+      // Verify destination leg also updated atomically
+      const destTx = await getTransaction(USER_A, transfer.destinationTransaction.id);
+      expect(destTx.amount).toBe(150000);
+      expect(destTx.notes).toBe('Increased sweep');
+
+      // Verify account balances adjusted by the additional 50,000 difference
+      // Checking: 900,000 - 50,000 = 850,000
+      // Savings: 5,100,000 + 50,000 = 5,150,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(850000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5150000);
+
+      // Verify audit trail recorded for transfer edit
+      const auditEntries = Array.from(mockStore.audit.values());
+      const editAudit = auditEntries.find((e) => e['action'] === 'TRANSFER_EDITED');
+      expect(editAudit).toBeDefined();
+      expect(editAudit!['details']['previousAmount']).toBe(100000);
+      expect(editAudit!['details']['updatedAmount']).toBe(150000);
+      expect(editAudit!['details']['amountDifference']).toBe(50000);
+    });
+
+    it('rejects illegal transfer mutations (changing type, adding split allocations, invalid amount)', async () => {
+      const transfer = await createInternalTransfer(USER_A, {
+        sourceAccountId: 'acc_checking',
+        destinationAccountId: 'acc_savings',
+        amount: 50000,
+        transactionDate: '2026-03-01',
+      });
+
+      // 1. Cannot change type to EXPENSE
+      await expect(
+        updateTransaction(USER_A, transfer.sourceTransaction.id, {
+          type: 'EXPENSE',
+        })
+      ).rejects.toThrow('Cannot change type of an internal transfer leg');
+
+      // 2. Cannot add split allocations
+      await expect(
+        updateTransaction(USER_A, transfer.sourceTransaction.id, {
+          allocations: [{ categoryId: 'cat_groceries', amount: 50000 }],
+        })
+      ).rejects.toThrow('Internal transfers cannot have split allocations');
+
+      // 3. Amount must be positive integer minor units
+      await expect(
+        updateTransaction(USER_A, transfer.sourceTransaction.id, {
+          amount: -10000,
+        })
+      ).rejects.toThrow('Transaction amount must be a positive integer in minor units');
+
+      await expect(
+        updateTransaction(USER_A, transfer.sourceTransaction.id, {
+          amount: 50.75,
+        })
+      ).rejects.toThrow('Transaction amount must be a positive integer in minor units');
+    });
+  });
+
+  describe('Slice 3.1 Hardening: Transfer Void Invariants', () => {
+    it('voiding destination leg voids both records atomically and reverses balances accurately', async () => {
+      const transfer = await createInternalTransfer(USER_A, {
+        sourceAccountId: 'acc_checking',
+        destinationAccountId: 'acc_savings',
+        amount: 250000, // ₹2,500.00
+        transactionDate: '2026-03-03',
+      });
+
+      // Balances: Checking: 750,000 | Savings: 5,250,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(750000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5250000);
+
+      // Void using the destination leg
+      const voidRes = await voidTransaction(USER_A, transfer.destinationTransaction.id, 'Wrong amount initiated');
+      expect(voidRes.status).toBe('VOIDED');
+      expect(voidRes.voidReason).toBe('Wrong amount initiated');
+
+      // Both accounts reversed to original balances (1,000,000 and 5,000,000)
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(1000000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5000000);
+
+      // Calling void again is idempotent and does not reverse balances a second time
+      const repeatVoid = await voidTransaction(USER_A, transfer.destinationTransaction.id);
+      expect(repeatVoid.status).toBe('VOIDED');
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(1000000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5000000);
+    });
+  });
+
+  describe('Slice 3.1 Hardening: Historical Transaction Edits', () => {
+    it('updates historical transaction amount and date and adjusts account balance accurately', async () => {
+      // Create transaction in previous month
+      const tx = await createTransaction(USER_A, {
+        accountId: 'acc_checking',
+        transactionDate: '2026-01-15',
+        amount: 40000, // ₹400.00 expense
+        type: 'EXPENSE',
+        description: 'Historical book purchase',
+      });
+
+      // Checking balance: 1,000,000 - 40,000 = 960,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(960000);
+
+      // User realizes the actual receipt was ₹600.00 on 2026-01-10
+      const updated = await updateTransaction(USER_A, tx.id, {
+        amount: 60000, // +₹200.00 expense
+        transactionDate: '2026-01-10',
+        description: 'Historical book purchase (corrected)',
+      });
+
+      expect(updated.amount).toBe(60000);
+      expect(updated.transactionDate).toBe('2026-01-10');
+
+      // Balance adjusted by additional -20,000 = 940,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(940000);
+    });
+  });
+
+  describe('Slice 3.1 Hardening: Idempotent Duplicate Requests', () => {
+    it('re-posting identical transaction with same idempotencyKey returns existing record without double-mutating', async () => {
+      const input: CreateTransactionInput = {
+        accountId: 'acc_checking',
+        transactionDate: '2026-03-05',
+        amount: 75000, // ₹750.00
+        type: 'EXPENSE',
+        description: 'Server hosting fee',
+        idempotencyKey: 'idemp-req-srv-750',
+      };
+
+      const first = await createTransaction(USER_A, input);
+      expect(first.id).toBeDefined();
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(925000);
+
+      // Duplicate request arrives
+      const second = await createTransaction(USER_A, input);
+      expect(second.id).toBe(first.id);
+
+      // Balance remains 925,000 (NOT double-deducted to 850,000)
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(925000);
+    });
+
+    it('re-posting internal transfer with same idempotencyKey returns existing transfer without double-mutating', async () => {
+      const input: CreateTransferInput = {
+        sourceAccountId: 'acc_checking',
+        destinationAccountId: 'acc_savings',
+        amount: 120000, // ₹1,200.00
+        transactionDate: '2026-03-05',
+        idempotencyKey: 'idemp-transfer-sweep-120',
+      };
+
+      const first = await createInternalTransfer(USER_A, input);
+      expect(first.sourceTransaction.id).toBeDefined();
+
+      // Checking: 1,000,000 - 120,000 = 880,000
+      // Savings: 5,000,000 + 120,000 = 5,120,000
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(880000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5120000);
+
+      // Duplicate transfer arrives
+      const second = await createInternalTransfer(USER_A, input);
+      expect(second.sourceTransaction.id).toBe(first.sourceTransaction.id);
+      expect(second.destinationTransaction.id).toBe(first.destinationTransaction.id);
+
+      // Balances preserved
+      expect(mockStore.accounts.get(`${USER_A}/acc_checking`)?.['calculatedBalance']).toBe(880000);
+      expect(mockStore.accounts.get(`${USER_A}/acc_savings`)?.['calculatedBalance']).toBe(5120000);
+    });
+  });
+
+  describe('Slice 3.1 Hardening: 10k+ Cursor Pagination Behavior', () => {
+    it('executes native Firestore cursor queries with O(limit) performance across 10,000+ items', async () => {
+      // Seed 10,000 transaction records into mockStore
+      const TOTAL_ITEMS = 10000;
+      const baseTimestamp = new Date('2026-01-01T00:00:00Z').getTime();
+
+      for (let i = 1; i <= TOTAL_ITEMS; i++) {
+        const dateOffset = Math.floor(i / 50); // multiple per day
+        const itemDate = new Date(baseTimestamp + dateOffset * 86400000).toISOString().split('T')[0];
+        const id = `tx_10k_${String(i).padStart(6, '0')}`;
+        mockStore.transactions.set(`${USER_A}/${id}`, {
+          id,
+          userId: USER_A,
+          accountId: 'acc_checking',
+          transactionDate: itemDate,
+          amount: 1000,
+          type: 'EXPENSE',
+          status: 'POSTED',
+          description: `Transaction #${i}`,
+          tags: ['bulk'],
+          allocations: [],
+          createdAt: new Date(baseTimestamp + i * 1000).toISOString(),
+          updatedAt: new Date(baseTimestamp + i * 1000).toISOString(),
+        });
+      }
+
+      expect(mockStore.transactions.size).toBe(TOTAL_ITEMS);
+
+      // 1. Fetch Page 1 with limit 25
+      const page1 = await getTransactions(USER_A, {
+        accountId: 'acc_checking',
+        limit: 25,
+      });
+
+      expect(page1.items.length).toBe(25);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.nextCursor).toBeDefined();
+      expect(page1.nextCursor).toBe(page1.items[24].id);
+
+      // 2. Fetch Page 2 with limit 25 using cursor
+      const page2 = await getTransactions(USER_A, {
+        accountId: 'acc_checking',
+        limit: 25,
+        cursor: page1.nextCursor!,
+      });
+
+      expect(page2.items.length).toBe(25);
+      expect(page2.hasMore).toBe(true);
+      expect(page2.nextCursor).toBeDefined();
+
+      // Invariant: Zero duplicate IDs between Page 1 and Page 2
+      const page1Ids = new Set(page1.items.map((t) => t.id));
+      for (const item of page2.items) {
+        expect(page1Ids.has(item.id)).toBe(false);
+      }
+
+      // Invariant: Strictly descending chronological order
+      const all40 = [...page1.items, ...page2.items];
+      for (let k = 0; k < all40.length - 1; k++) {
+        const cur = all40[k];
+        const nxt = all40[k + 1];
+        expect(cur.transactionDate >= nxt.transactionDate).toBe(true);
+      }
     });
   });
 });
