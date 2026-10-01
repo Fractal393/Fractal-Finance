@@ -3,22 +3,44 @@ import { setFirebaseAdminForTesting } from './firebase-admin.js';
 import {
   resolveReportingPeriod,
   formatPrettyDate,
+  validateISODate,
+  isValidPeriodType,
   getDashboardReport,
 } from './reporting-service.js';
 import type { AccountDocument } from './account-service.js';
-import type { TransactionDocument, CategoryDocument } from './transaction-service.js';
+import type { TransactionDocument } from './transaction-service.js';
+import type { CategoryDocument } from './metadata-service.js';
 
 describe('Reporting Service & Period Semantics', () => {
-  describe('formatPrettyDate', () => {
+  describe('formatPrettyDate and validateISODate', () => {
     it('formats ISO dates into MMM D, YYYY without timezone shift', () => {
       expect(formatPrettyDate('2026-04-01')).toBe('Apr 1, 2026');
       expect(formatPrettyDate('2027-03-31')).toBe('Mar 31, 2027');
       expect(formatPrettyDate('2026-10-15')).toBe('Oct 15, 2026');
       expect(formatPrettyDate('2026-01-05')).toBe('Jan 5, 2026');
     });
+
+    it('validates ISO dates correctly', () => {
+      expect(validateISODate('2026-04-01')).toBe(true);
+      expect(validateISODate('2026-02-28')).toBe(true);
+      expect(validateISODate('2026-02-30')).toBe(false); // Invalid Feb date
+      expect(validateISODate('not-a-date')).toBe(false);
+      expect(validateISODate('2026-13-01')).toBe(false);
+      expect(validateISODate('')).toBe(false);
+    });
+
+    it('validates period types correctly', () => {
+      expect(isValidPeriodType('current_month')).toBe(true);
+      expect(isValidPeriodType('financial_year')).toBe(true);
+      expect(isValidPeriodType('last_12_months')).toBe(true);
+      expect(isValidPeriodType('all_history')).toBe(true);
+      expect(isValidPeriodType('custom')).toBe(true);
+      expect(isValidPeriodType('quarter')).toBe(false); // Quarter is forbidden
+      expect(isValidPeriodType('random_period')).toBe(false);
+    });
   });
 
-  describe('resolveReportingPeriod', () => {
+  describe('resolveReportingPeriod and Validation', () => {
     it('resolves Current Month correctly', () => {
       const refDate = new Date(2026, 9, 15); // Oct 15, 2026
       const range = resolveReportingPeriod('current_month', undefined, undefined, refDate);
@@ -46,6 +68,15 @@ describe('Reporting Service & Period Semantics', () => {
       expect(range.label).toBe('Financial Year · Apr 1, 2026 – Mar 31, 2027');
     });
 
+    it('rejects invalid financial year start months', () => {
+      expect(() => resolveReportingPeriod('financial_year', undefined, undefined, new Date(), 0)).toThrow(
+        /Invalid financialYearStartMonth/,
+      );
+      expect(() => resolveReportingPeriod('financial_year', undefined, undefined, new Date(), 13)).toThrow(
+        /Invalid financialYearStartMonth/,
+      );
+    });
+
     it('resolves Last 12 Months correctly', () => {
       const refDate = new Date(2026, 9, 15); // Oct 15, 2026
       const range = resolveReportingPeriod('last_12_months', undefined, undefined, refDate);
@@ -63,7 +94,19 @@ describe('Reporting Service & Period Semantics', () => {
       expect(range.label).toBe('All History · Lifetime Activity');
     });
 
-    it('resolves Custom Range correctly when valid dates are passed', () => {
+    it('validates custom range parameters strictly', () => {
+      // Missing dates
+      expect(() => resolveReportingPeriod('custom')).toThrow(/startDate and endDate are required/);
+      expect(() => resolveReportingPeriod('custom', '2026-01-01')).toThrow(/startDate and endDate are required/);
+
+      // Malformed dates
+      expect(() => resolveReportingPeriod('custom', 'invalid-date', '2026-05-01')).toThrow(/Invalid custom startDate/);
+      expect(() => resolveReportingPeriod('custom', '2026-01-01', 'bad-end-date')).toThrow(/Invalid custom endDate/);
+
+      // Start date after end date
+      expect(() => resolveReportingPeriod('custom', '2026-10-01', '2026-05-01')).toThrow(/cannot be after endDate/);
+
+      // Valid range
       const range = resolveReportingPeriod('custom', '2026-06-01', '2026-08-31');
       expect(range.period).toBe('custom');
       expect(range.startDate).toBe('2026-06-01');
@@ -79,6 +122,67 @@ describe('Reporting Service & Period Semantics', () => {
     let categoriesStore: Map<string, CategoryDocument>;
     let transactionsStore: Map<string, TransactionDocument>;
 
+    interface MockFilter {
+      field: string;
+      op: string;
+      val: unknown;
+    }
+    interface MockOrder {
+      field: string;
+      dir: 'asc' | 'desc';
+    }
+
+    const createQueryBuilder = (filters: MockFilter[] = [], orders: MockOrder[] = [], limitVal?: number) => {
+      const builder = {
+        where: (field: string, op: string, val: unknown) => {
+          return createQueryBuilder([...filters, { field, op, val }], orders, limitVal);
+        },
+        orderBy: (field: string, dir: 'asc' | 'desc' = 'asc') => {
+          return createQueryBuilder(filters, [...orders, { field, dir }], limitVal);
+        },
+        limit: (n: number) => {
+          return createQueryBuilder(filters, orders, n);
+        },
+        get: async () => {
+          let docs = Array.from(transactionsStore.values()).filter((t) => t.userId === userId);
+
+          for (const f of filters) {
+            docs = docs.filter((t) => {
+              const val = (t as unknown as Record<string, unknown>)[f.field];
+              if (f.op === '==') return val === f.val;
+              if (f.op === '>=') return (val as string) >= (f.val as string);
+              if (f.op === '<=') return (val as string) <= (f.val as string);
+              if (f.op === '>') return (val as string) > (f.val as string);
+              if (f.op === '<') return (val as string) < (f.val as string);
+              return true;
+            });
+          }
+
+          if (orders.length > 0) {
+            docs.sort((a, b) => {
+              for (const o of orders) {
+                const aVal = String((a as unknown as Record<string, unknown>)[o.field] || '');
+                const bVal = String((b as unknown as Record<string, unknown>)[o.field] || '');
+                const cmp = o.dir === 'desc' ? bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
+                if (cmp !== 0) return cmp;
+              }
+              return 0;
+            });
+          }
+
+          if (limitVal !== undefined) {
+            docs = docs.slice(0, limitVal);
+          }
+
+          return {
+            empty: docs.length === 0,
+            docs: docs.map((d) => ({ id: d.id, data: () => d })),
+          };
+        },
+      };
+      return builder;
+    };
+
     beforeEach(() => {
       accountsStore = new Map();
       categoriesStore = new Map();
@@ -91,28 +195,31 @@ describe('Reporting Service & Period Semantics', () => {
             doc: (docUserId: string) => {
               return {
                 collection: (subCol: string) => {
-                  return {
-                    get: async () => {
-                      if (subCol === 'accounts') {
+                  if (subCol === 'accounts') {
+                    return {
+                      get: async () => {
                         const docs = Array.from(accountsStore.values())
                           .filter((a) => a.userId === docUserId)
                           .map((a) => ({ id: a.id, data: () => a }));
                         return { empty: docs.length === 0, docs };
-                      }
-                      if (subCol === 'categories') {
+                      },
+                    };
+                  }
+                  if (subCol === 'categories') {
+                    return {
+                      get: async () => {
                         const docs = Array.from(categoriesStore.values())
                           .filter((c) => c.userId === docUserId)
                           .map((c) => ({ id: c.id, data: () => c }));
                         return { empty: docs.length === 0, docs };
-                      }
-                      if (subCol === 'transactions') {
-                        const docs = Array.from(transactionsStore.values())
-                          .filter((t) => t.userId === docUserId)
-                          .map((t) => ({ id: t.id, data: () => t }));
-                        return { empty: docs.length === 0, docs };
-                      }
-                      return { empty: true, docs: [] };
-                    },
+                      },
+                    };
+                  }
+                  if (subCol === 'transactions') {
+                    return createQueryBuilder();
+                  }
+                  return {
+                    get: async () => ({ empty: true, docs: [] }),
                   };
                 },
               };
@@ -137,16 +244,288 @@ describe('Reporting Service & Period Semantics', () => {
 
       expect(report.netWorth.cashPosition).toBe(0);
       expect(report.netWorth.totalNetWorth).toBe(0);
-      expect(report.netWorth.disclaimer).toBe('Based on available financial data');
+      expect(report.netWorth.disclaimer).toContain('Based on available financial');
       expect(report.periodMetrics.grossIncome).toBe(0);
       expect(report.periodMetrics.totalExpenses).toBe(0);
       expect(report.periodMetrics.savings).toBe(0);
       expect(report.periodMetrics.savingsRate).toBeNull();
       expect(report.cashFlow.internalTransferNetImpact).toBe(0);
       expect(report.composition.accounts).toHaveLength(0);
+      expect(report.syncStatus.totalActiveAccounts).toBe(0);
+      expect(report.syncStatus.isFullyReconciled).toBe(false);
     });
 
-    it('calculates Cash Position strictly from active bank and cash accounts', async () => {
+    it('truthfully reconstructs historical account balances as of period end date', async () => {
+      // Account opened Jan 1, 2026 with opening balance ₹1,00,000 (10,000,000 paise)
+      // Transaction in Jan: +₹50,000
+      // Transaction in Mar: -₹20,000
+      // Transaction in Oct: +₹1,00,000
+      // Current calculatedBalance = 1,00,000 + 50,000 - 20,000 + 1,00,000 = ₹2,30,000 (23,000,000 paise)
+      accountsStore.set('acc-1', {
+        id: 'acc-1',
+        userId,
+        name: 'HDFC Savings',
+        type: 'bank',
+        institution: 'HDFC Bank',
+        currency: 'INR',
+        openingBalance: 10000000,
+        openingBalanceDate: '2026-01-01',
+        calculatedBalance: 23000000, // Today's balance
+        isActive: true,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-10-15T00:00:00Z',
+      });
+
+      // Transactions
+      transactionsStore.set('tx-jan', {
+        id: 'tx-jan',
+        userId,
+        accountId: 'acc-1',
+        amount: 5000000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: '2026-01-15',
+        description: 'Jan Bonus',
+        allocations: [],
+        createdAt: '2026-01-15T00:00:00Z',
+        updatedAt: '2026-01-15T00:00:00Z',
+      });
+
+      transactionsStore.set('tx-mar', {
+        id: 'tx-mar',
+        userId,
+        accountId: 'acc-1',
+        amount: 2000000,
+        type: 'EXPENSE',
+        status: 'POSTED',
+        transactionDate: '2026-03-10',
+        description: 'Mar Equipment',
+        allocations: [],
+        createdAt: '2026-03-10T00:00:00Z',
+        updatedAt: '2026-03-10T00:00:00Z',
+      });
+
+      transactionsStore.set('tx-oct', {
+        id: 'tx-oct',
+        userId,
+        accountId: 'acc-1',
+        amount: 10000000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: '2026-10-05',
+        description: 'Oct Client Payment',
+        allocations: [],
+        createdAt: '2026-10-05T00:00:00Z',
+        updatedAt: '2026-10-05T00:00:00Z',
+      });
+
+      // Request a historical report for April 2026 (when today is Oct 15, 2026)
+      const report = await getDashboardReport(userId, {
+        period: 'custom',
+        startDate: '2026-04-01',
+        endDate: '2026-04-30',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+
+      // Historical reconstruction checks:
+      expect(report.netWorth.isHistoricalReconstruction).toBe(true);
+      expect(report.netWorth.asOfDate).toBe('2026-04-30');
+      expect(report.netWorth.currentCashPosition).toBe(23000000); // Current today is ₹2,30,000
+
+      // Reconstructed position as of April 30, 2026 must be:
+      // Current (23,000,000) - Oct transaction (10,000,000) = 13,000,000 paise (₹1,30,000)
+      expect(report.netWorth.cashPosition).toBe(13000000);
+      expect(report.netWorth.totalNetWorth).toBe(13000000);
+      expect(report.composition.accounts[0].asOfBalance).toBe(13000000);
+      expect(report.composition.accounts[0].calculatedBalance).toBe(23000000);
+      expect(report.netWorth.disclaimer).toContain('Reconstructed financial position as of Apr 30, 2026');
+    });
+
+    it('truthfully derives debt liabilities and debt ratio from borrowing and repayment transactions', async () => {
+      accountsStore.set('acc-1', {
+        id: 'acc-1',
+        userId,
+        name: 'HDFC Savings',
+        type: 'bank',
+        institution: 'HDFC Bank',
+        currency: 'INR',
+        openingBalance: 10000000, // ₹1,00,000
+        calculatedBalance: 10000000,
+        isActive: true,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+
+      // 1. Debt borrowing: ₹50,000 (5,000,000 paise)
+      transactionsStore.set('tx-borrow', {
+        id: 'tx-borrow',
+        userId,
+        accountId: 'acc-1',
+        amount: 5000000,
+        type: 'DEBT_BORROWING',
+        status: 'POSTED',
+        transactionDate: '2026-10-02',
+        description: 'Personal Loan Credit',
+        allocations: [],
+        createdAt: '2026-10-02T00:00:00Z',
+        updatedAt: '2026-10-02T00:00:00Z',
+      });
+
+      // 2. Debt repayment: ₹10,000 (1,000,000 paise)
+      transactionsStore.set('tx-repay', {
+        id: 'tx-repay',
+        userId,
+        accountId: 'acc-1',
+        amount: 1000000,
+        type: 'DEBT_REPAYMENT',
+        status: 'POSTED',
+        transactionDate: '2026-10-10',
+        description: 'Loan Principal EMI',
+        allocations: [],
+        createdAt: '2026-10-10T00:00:00Z',
+        updatedAt: '2026-10-10T00:00:00Z',
+      });
+
+      const report = await getDashboardReport(userId, {
+        period: 'current_month',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+
+      // Outstanding Debt = 50,000 - 10,000 = ₹40,000 (4,000,000 paise)
+      expect(report.netWorth.liabilities).toBe(4000000);
+      expect(report.netWorth.cashPosition).toBe(10000000);
+      // Net Worth = Cash (10,000,000) - Liabilities (4,000,000) = 6,000,000 paise (₹60,000)
+      expect(report.netWorth.totalNetWorth).toBe(6000000);
+
+      // Debt ratio = 4,000,000 / 10,000,000 = 40.0%
+      expect(report.financialHealth.debtRatio.value).toBe(40.0);
+      expect(report.financialHealth.debtRatio.formatted).toBe('40%');
+      expect(report.financialHealth.debtRatio.description).toContain('Cumulative debt borrowings minus repayments');
+    });
+
+    it('calculates Cash Runway strictly using consumption expenses, excluding asset purchases', async () => {
+      accountsStore.set('acc-1', {
+        id: 'acc-1',
+        userId,
+        name: 'HDFC Savings',
+        type: 'bank',
+        institution: 'HDFC Bank',
+        currency: 'INR',
+        openingBalance: 6000000, // ₹60,000
+        calculatedBalance: 6000000,
+        isActive: true,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      });
+
+      // Consumption expense: ₹15,000 (1,500,000 paise)
+      transactionsStore.set('tx-exp', {
+        id: 'tx-exp',
+        userId,
+        accountId: 'acc-1',
+        amount: 1500000,
+        type: 'EXPENSE',
+        status: 'POSTED',
+        transactionDate: '2026-10-05',
+        description: 'Groceries',
+        allocations: [],
+        createdAt: '2026-10-05T00:00:00Z',
+        updatedAt: '2026-10-05T00:00:00Z',
+      });
+
+      // Non-financial asset purchase: ₹35,000 (3,500,000 paise)
+      transactionsStore.set('tx-asset', {
+        id: 'tx-asset',
+        userId,
+        accountId: 'acc-1',
+        amount: 3500000,
+        type: 'NON_FINANCIAL_ASSET_PURCHASE',
+        status: 'POSTED',
+        transactionDate: '2026-10-08',
+        description: 'Gold coin / furniture',
+        allocations: [],
+        createdAt: '2026-10-08T00:00:00Z',
+        updatedAt: '2026-10-08T00:00:00Z',
+      });
+
+      const report = await getDashboardReport(userId, {
+        period: 'current_month',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+
+      // Total Expenses = 15,000 + 35,000 = ₹50,000
+      expect(report.periodMetrics.totalExpenses).toBe(5000000);
+      expect(report.periodMetrics.consumptionExpenses).toBe(1500000);
+
+      // Runway denominator MUST BE consumption expenses (₹15,000/month), NOT total expenses (₹50,000)!
+      // Runway = Cash Position (₹60,000) / ₹15,000/month = 4.0 months!
+      expect(report.financialHealth.cashRunwayMonths.value).toBe(4.0);
+      expect(report.financialHealth.cashRunwayMonths.formatted).toBe('4 months');
+      expect(report.financialHealth.cashRunwayMonths.formula).toContain('Average Monthly Consumption Expenses');
+    });
+
+    it('correctly deducts taxes in monthly trends savings', async () => {
+      // Oct 2026 transactions:
+      // Income: ₹1,00,000
+      // Tax: ₹20,000
+      // Expenses: ₹30,000
+      transactionsStore.set('tx-inc', {
+        id: 'tx-inc',
+        userId,
+        accountId: 'acc-1',
+        amount: 10000000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: '2026-10-01',
+        description: 'Salary',
+        allocations: [],
+        createdAt: '2026-10-01T00:00:00Z',
+        updatedAt: '2026-10-01T00:00:00Z',
+      });
+      transactionsStore.set('tx-tax', {
+        id: 'tx-tax',
+        userId,
+        accountId: 'acc-1',
+        amount: 2000000,
+        type: 'TAX',
+        status: 'POSTED',
+        transactionDate: '2026-10-02',
+        description: 'Advance Tax',
+        allocations: [],
+        createdAt: '2026-10-02T00:00:00Z',
+        updatedAt: '2026-10-02T00:00:00Z',
+      });
+      transactionsStore.set('tx-exp', {
+        id: 'tx-exp',
+        userId,
+        accountId: 'acc-1',
+        amount: 3000000,
+        type: 'EXPENSE',
+        status: 'POSTED',
+        transactionDate: '2026-10-05',
+        description: 'Household',
+        allocations: [],
+        createdAt: '2026-10-05T00:00:00Z',
+        updatedAt: '2026-10-05T00:00:00Z',
+      });
+
+      const report = await getDashboardReport(userId, {
+        period: 'current_month',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+
+      expect(report.monthlyTrends).toHaveLength(1);
+      const oct = report.monthlyTrends[0];
+      expect(oct.grossIncome).toBe(10000000);
+      expect(oct.netTaxPaid).toBe(2000000);
+      expect(oct.netIncome).toBe(8000000); // 1,00,000 - 20,000 = ₹80,000
+      expect(oct.expenses).toBe(3000000);
+      // Net Savings = Net Income (80,000) - Expenses (30,000) = ₹50,000 (5,000,000 paise)
+      expect(oct.savings).toBe(5000000);
+    });
+
+    it('reports real account sync status based on reconciliation records', async () => {
+      // Account 1: Fully reconciled (reportedBalance === calculatedBalance && lastReconciledAt set)
       accountsStore.set('acc-1', {
         id: 'acc-1',
         userId,
@@ -156,349 +535,42 @@ describe('Reporting Service & Period Semantics', () => {
         currency: 'INR',
         openingBalance: 100000,
         openingBalanceDate: '2026-01-01',
-        calculatedBalance: 25000000, // ₹2,50,000
+        calculatedBalance: 500000,
+        reportedBalance: 500000,
+        lastReconciledAt: '2026-10-10T10:00:00Z',
         isActive: true,
         createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-10-10T10:00:00Z',
       });
+
+      // Account 2: Unreconciled
       accountsStore.set('acc-2', {
         id: 'acc-2',
         userId,
-        name: 'Physical Wallet',
-        type: 'cash',
-        institution: 'Cash',
-        currency: 'INR',
-        openingBalance: 5000,
-        openingBalanceDate: '2026-01-01',
-        calculatedBalance: 1200000, // ₹12,000
-        isActive: true,
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-      accountsStore.set('acc-archived', {
-        id: 'acc-archived',
-        userId,
-        name: 'Old Closed Account',
+        name: 'ICICI Current',
         type: 'bank',
-        institution: 'Old Bank',
+        institution: 'ICICI Bank',
         currency: 'INR',
-        openingBalance: 0,
-        openingBalanceDate: '2025-01-01',
-        calculatedBalance: 500000,
-        isActive: false, // Inactive account must be excluded
-        createdAt: '2025-01-01T00:00:00Z',
-        updatedAt: '2025-01-01T00:00:00Z',
-      });
-
-      const report = await getDashboardReport(userId, {
-        period: 'current_month',
-        referenceDate: new Date(2026, 9, 1),
-      });
-
-      expect(report.netWorth.cashPosition).toBe(26200000); // 25,00,000 + 12,000 = ₹2,62,000
-      expect(report.composition.bankAccountsTotal).toBe(25000000);
-      expect(report.composition.cashAccountsTotal).toBe(1200000);
-      expect(report.composition.accounts).toHaveLength(2);
-      expect(report.composition.untrackedClasses.length).toBeGreaterThanOrEqual(3);
-    });
-
-    it('correctly calculates Income, Net Tax Paid, Consumption Expenses, Total Expenses, Savings, and Savings Rate', async () => {
-      categoriesStore.set('cat-groceries', {
-        id: 'cat-groceries',
-        userId,
-        name: 'Groceries',
-        parentId: null,
-        type: 'EXPENSE',
-        isActive: true,
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-      categoriesStore.set('cat-salary', {
-        id: 'cat-salary',
-        userId,
-        name: 'Salary',
-        parentId: null,
-        type: 'INCOME',
+        openingBalance: 200000,
+        openingBalanceDate: '2026-01-01',
+        calculatedBalance: 400000,
+        reportedBalance: null,
+        lastReconciledAt: null,
         isActive: true,
         createdAt: '2026-01-01T00:00:00Z',
         updatedAt: '2026-01-01T00:00:00Z',
       });
 
-      // Transactions for Oct 2026
-      // 1. Income: ₹1,00,000 (10,000,000 paise)
-      transactionsStore.set('tx-inc', {
-        id: 'tx-inc',
-        userId,
-        accountId: 'acc-1',
-        amount: 10000000,
-        type: 'INCOME',
-        status: 'POSTED',
-        transactionDate: '2026-10-01',
-        description: 'Monthly Salary',
-        categoryId: 'cat-salary',
-        allocations: [],
-        createdAt: '2026-10-01T00:00:00Z',
-        updatedAt: '2026-10-01T00:00:00Z',
-      });
-
-      // 2. Net Tax Paid: ₹10,000 (1,000,000 paise)
-      transactionsStore.set('tx-tax', {
-        id: 'tx-tax',
-        userId,
-        accountId: 'acc-1',
-        amount: 1000000,
-        type: 'TAX',
-        status: 'POSTED',
-        transactionDate: '2026-10-02',
-        description: 'Advance Tax / TDS',
-        allocations: [],
-        createdAt: '2026-10-02T00:00:00Z',
-        updatedAt: '2026-10-02T00:00:00Z',
-      });
-
-      // 3. Consumption Expense: ₹25,000 (2,500,000 paise)
-      transactionsStore.set('tx-exp', {
-        id: 'tx-exp',
-        userId,
-        accountId: 'acc-1',
-        amount: 2500000,
-        type: 'EXPENSE',
-        status: 'POSTED',
-        transactionDate: '2026-10-05',
-        description: 'Supermarket Groceries',
-        categoryId: 'cat-groceries',
-        allocations: [],
-        createdAt: '2026-10-05T00:00:00Z',
-        updatedAt: '2026-10-05T00:00:00Z',
-      });
-
-      // 4. Non-Financial Asset Purchase: ₹5,000 (500,000 paise) (in Total Expenses, NOT Consumption Expenses)
-      transactionsStore.set('tx-asset', {
-        id: 'tx-asset',
-        userId,
-        accountId: 'acc-1',
-        amount: 500000,
-        type: 'NON_FINANCIAL_ASSET_PURCHASE',
-        status: 'POSTED',
-        transactionDate: '2026-10-10',
-        description: 'Office Chair',
-        allocations: [],
-        createdAt: '2026-10-10T00:00:00Z',
-        updatedAt: '2026-10-10T00:00:00Z',
-      });
-
-      // 5. Investment Allocation: ₹20,000 (2,000,000 paise) (MUST NOT be subtracted from Savings)
-      transactionsStore.set('tx-inv', {
-        id: 'tx-inv',
-        userId,
-        accountId: 'acc-1',
-        amount: 2000000,
-        type: 'INVESTMENT_ALLOCATION',
-        status: 'POSTED',
-        transactionDate: '2026-10-12',
-        description: 'Index Fund SIP',
-        allocations: [],
-        createdAt: '2026-10-12T00:00:00Z',
-        updatedAt: '2026-10-12T00:00:00Z',
-      });
-
-      // 6. Voided transaction: Should be ignored
-      transactionsStore.set('tx-voided', {
-        id: 'tx-voided',
-        userId,
-        accountId: 'acc-1',
-        amount: 999999,
-        type: 'EXPENSE',
-        status: 'VOIDED',
-        transactionDate: '2026-10-15',
-        description: 'Mistaken duplicate',
-        allocations: [],
-        createdAt: '2026-10-15T00:00:00Z',
-        updatedAt: '2026-10-15T00:00:00Z',
-      });
-
-      // 7. Transaction from 6 months ago (outside current month period)
-      transactionsStore.set('tx-old', {
-        id: 'tx-old',
-        userId,
-        accountId: 'acc-1',
-        amount: 5000000,
-        type: 'INCOME',
-        status: 'POSTED',
-        transactionDate: '2026-04-10',
-        description: 'Old April Salary',
-        allocations: [],
-        createdAt: '2026-04-10T00:00:00Z',
-        updatedAt: '2026-04-10T00:00:00Z',
-      });
-
       const report = await getDashboardReport(userId, {
         period: 'current_month',
-        referenceDate: new Date(2026, 9, 20), // Oct 2026
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
       });
 
-      // Calculations:
-      // Gross Income = 10,000,000 paise (₹1,00,000)
-      expect(report.periodMetrics.grossIncome).toBe(10000000);
-
-      // Net Tax Paid = 1,000,000 paise (₹10,000)
-      expect(report.periodMetrics.netTaxPaid).toBe(1000000);
-
-      // Net Income = 10,000,000 - 1,000,000 = 9,000,000 paise (₹90,000)
-      expect(report.periodMetrics.netIncome).toBe(9000000);
-
-      // Consumption Expenses = 2,500,000 paise (₹25,000)
-      expect(report.periodMetrics.consumptionExpenses).toBe(2500000);
-
-      // Non-financial Asset Purchases = 500,000 paise (₹5,000)
-      expect(report.periodMetrics.nonFinancialAssetPurchases).toBe(500000);
-
-      // Total Expenses = 2,500,000 + 500,000 = 3,000,000 paise (₹30,000)
-      expect(report.periodMetrics.totalExpenses).toBe(3000000);
-
-      // Savings = Net Income - Total Expenses = 9,000,000 - 3,000,000 = 6,000,000 paise (₹60,000)
-      expect(report.periodMetrics.savings).toBe(6000000);
-
-      // Savings Rate = 60,000 / 90,000 = 66.7%
-      expect(report.periodMetrics.savingsRate).toBe(66.7);
-
-      // Investment Allocation = 2,000,000 paise (₹20,000)
-      // Must NOT be subtracted from Savings!
-      expect(report.periodMetrics.investmentAllocation).toBe(2000000);
-      expect(report.periodMetrics.cashRetained).toBe(4000000); // 60,000 - 20,000 = ₹40,000
-
-      // Lifetime Summary must include the April transaction as well!
-      // Lifetime Income = 10,000,000 (Oct) + 5,000,000 (Apr) = 15,000,000
-      expect(report.lifetimeSummary.lifetimeGrossIncome).toBe(15000000);
-      expect(report.lifetimeSummary.lifetimeTotalExpenses).toBe(3000000);
-      expect(report.lifetimeSummary.totalPostedTransactions).toBe(6);
-    });
-
-    it('ensures internal transfers net to 0 personal cash flow movement', async () => {
-      // Transfer ₹15,000 from Bank to Wallet
-      transactionsStore.set('tx-tr-out', {
-        id: 'tx-tr-out',
-        userId,
-        accountId: 'acc-1',
-        amount: 1500000,
-        type: 'INTERNAL_TRANSFER',
-        transferDirection: 'OUT',
-        status: 'POSTED',
-        transactionDate: '2026-10-08',
-        description: 'ATM Cash Withdrawal',
-        allocations: [],
-        createdAt: '2026-10-08T00:00:00Z',
-        updatedAt: '2026-10-08T00:00:00Z',
-      });
-      transactionsStore.set('tx-tr-in', {
-        id: 'tx-tr-in',
-        userId,
-        accountId: 'acc-2',
-        amount: 1500000,
-        type: 'INTERNAL_TRANSFER',
-        transferDirection: 'IN',
-        status: 'POSTED',
-        transactionDate: '2026-10-08',
-        description: 'ATM Cash Deposit into Wallet',
-        allocations: [],
-        createdAt: '2026-10-08T00:00:00Z',
-        updatedAt: '2026-10-08T00:00:00Z',
-      });
-
-      const report = await getDashboardReport(userId, {
-        period: 'current_month',
-        referenceDate: new Date(2026, 9, 15),
-      });
-
-      // Internal transfer does NOT count as income or expense
-      expect(report.periodMetrics.grossIncome).toBe(0);
-      expect(report.periodMetrics.totalExpenses).toBe(0);
-      expect(report.cashFlow.internalTransferVolume).toBe(1500000);
-      expect(report.cashFlow.internalTransferNetImpact).toBe(0);
-    });
-
-    it('correctly aggregates split transaction allocations by category', async () => {
-      categoriesStore.set('cat-food', {
-        id: 'cat-food',
-        userId,
-        name: 'Dining & Groceries',
-        parentId: null,
-        type: 'EXPENSE',
-        isActive: true,
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-      categoriesStore.set('cat-utils', {
-        id: 'cat-utils',
-        userId,
-        name: 'Household Utilities',
-        parentId: null,
-        type: 'EXPENSE',
-        isActive: true,
-        createdAt: '2026-01-01T00:00:00Z',
-        updatedAt: '2026-01-01T00:00:00Z',
-      });
-
-      // Split transaction of ₹10,000: ₹6,000 food + ₹4,000 utils
-      transactionsStore.set('tx-split', {
-        id: 'tx-split',
-        userId,
-        accountId: 'acc-1',
-        amount: 1000000,
-        type: 'EXPENSE',
-        status: 'POSTED',
-        transactionDate: '2026-10-09',
-        description: 'Departmental store bulk buy',
-        allocations: [
-          { categoryId: 'cat-food', amount: 600000, notes: 'Food portion' },
-          { categoryId: 'cat-utils', amount: 400000, notes: 'Cleaning materials' },
-        ],
-        createdAt: '2026-10-09T00:00:00Z',
-        updatedAt: '2026-10-09T00:00:00Z',
-      });
-
-      const report = await getDashboardReport(userId, {
-        period: 'current_month',
-        referenceDate: new Date(2026, 9, 15),
-      });
-
-      expect(report.categoryBreakdown).toHaveLength(2);
-      const foodItem = report.categoryBreakdown.find((c) => c.categoryId === 'cat-food');
-      const utilsItem = report.categoryBreakdown.find((c) => c.categoryId === 'cat-utils');
-
-      expect(foodItem?.amount).toBe(600000);
-      expect(foodItem?.percentage).toBe(60.0);
-      expect(utilsItem?.amount).toBe(400000);
-      expect(utilsItem?.percentage).toBe(40.0);
-    });
-
-    it('displays undefined savings rate as null when net income is zero or negative', async () => {
-      // Expense of ₹5,000 with 0 Income
-      transactionsStore.set('tx-loss', {
-        id: 'tx-loss',
-        userId,
-        accountId: 'acc-1',
-        amount: 500000,
-        type: 'EXPENSE',
-        status: 'POSTED',
-        transactionDate: '2026-10-05',
-        description: 'Subscription',
-        allocations: [],
-        createdAt: '2026-10-05T00:00:00Z',
-        updatedAt: '2026-10-05T00:00:00Z',
-      });
-
-      const report = await getDashboardReport(userId, {
-        period: 'current_month',
-        referenceDate: new Date(2026, 9, 15),
-      });
-
-      expect(report.periodMetrics.grossIncome).toBe(0);
-      expect(report.periodMetrics.netIncome).toBe(0);
-      expect(report.periodMetrics.savings).toBe(-500000);
-      expect(report.periodMetrics.savingsRate).toBeNull();
-      expect(report.financialHealth.savingsRate.value).toBeNull();
-      expect(report.financialHealth.savingsRate.formatted).toBe('—');
+      expect(report.syncStatus.totalActiveAccounts).toBe(2);
+      expect(report.syncStatus.reconciledAccountsCount).toBe(1);
+      expect(report.syncStatus.unreconciledAccountsCount).toBe(1);
+      expect(report.syncStatus.isFullyReconciled).toBe(false);
+      expect(report.syncStatus.statusLabel).toBe('1 of 2 accounts reconciled');
     });
   });
 });

@@ -37,6 +37,9 @@ import {
 import {
   getDashboardReport,
   ReportingPeriodType,
+  isValidPeriodType,
+  validateISODate,
+  VALID_PERIOD_TYPES,
 } from './server/reporting-service.js';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
@@ -520,10 +523,54 @@ app.put('/api/tags/:id', authenticateToken, requireVerifiedEmail, async (req: Au
  */
 app.get('/api/reports/dashboard', authenticateToken, requireVerifiedEmail, async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const period = (req.query['period'] as ReportingPeriodType) || 'current_month';
+    const rawPeriod = req.query['period'];
+    const period = (rawPeriod as ReportingPeriodType) || 'current_month';
+    if (!isValidPeriodType(period)) {
+      res.status(400).json({
+        error: 'INVALID_PERIOD',
+        message: `period must be one of: ${VALID_PERIOD_TYPES.join(', ')}`,
+      });
+      return;
+    }
+
     const startDate = req.query['startDate'] as string | undefined;
     const endDate = req.query['endDate'] as string | undefined;
-    const fyStartMonth = req.query['fyStartMonth'] ? parseInt(req.query['fyStartMonth'] as string, 10) : 4;
+    if (period === 'custom') {
+      if (!startDate || !endDate) {
+        res.status(400).json({
+          error: 'MISSING_DATE_RANGE',
+          message: 'Both startDate and endDate are required when period is custom',
+        });
+        return;
+      }
+      if (!validateISODate(startDate) || !validateISODate(endDate)) {
+        res.status(400).json({
+          error: 'INVALID_DATE_FORMAT',
+          message: 'startDate and endDate must be valid dates in YYYY-MM-DD format',
+        });
+        return;
+      }
+      if (startDate > endDate) {
+        res.status(400).json({
+          error: 'INVALID_DATE_RANGE',
+          message: 'startDate must be before or equal to endDate',
+        });
+        return;
+      }
+    }
+
+    let fyStartMonth = 4;
+    if (req.query['fyStartMonth'] !== undefined) {
+      const parsed = Number(req.query['fyStartMonth']);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 12) {
+        res.status(400).json({
+          error: 'INVALID_FY_START_MONTH',
+          message: 'fyStartMonth must be an integer between 1 and 12',
+        });
+        return;
+      }
+      fyStartMonth = parsed;
+    }
 
     const report = await getDashboardReport(req.user!.uid, {
       period,
@@ -534,7 +581,7 @@ app.get('/api/reports/dashboard', authenticateToken, requireVerifiedEmail, async
     res.json(report);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Failed to generate dashboard report';
-    res.status(500).json({ error: 'DASHBOARD_REPORT_FAILED', message });
+    res.status(400).json({ error: 'DASHBOARD_REPORT_FAILED', message });
   }
 });
 

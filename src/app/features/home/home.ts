@@ -8,7 +8,7 @@ import { RouterLink } from '@angular/router';
 import { FormControl, FormGroup, ReactiveFormsModule, Validators } from '@angular/forms';
 import { MatIconModule } from '@angular/material/icon';
 import { ReportingState } from '../../core/reporting/reporting-state';
-import { ReportingPeriodType } from '../../core/reporting/reporting-models';
+import { ReportingPeriodType, formatPrettyDate } from '../../core/reporting/reporting-models';
 import { formatMinorUnits } from '../../core/accounts/account-models';
 import { QuickAddService } from '../../core/transactions/quick-add.service';
 
@@ -42,12 +42,24 @@ interface PeriodOption {
             </p>
           </div>
 
-          <!-- Freshness Context & Quick Refresh -->
+          <!-- Real Account Sync Status & Quick Refresh -->
           <div class="flex items-center space-x-3 text-xs text-[var(--color-secondary)]">
-            <span class="inline-flex items-center space-x-1.5">
-              <span class="w-2 h-2 rounded-full bg-[var(--color-positive)]"></span>
-              <span>All active accounts synced</span>
-            </span>
+            @if (reportingState.report(); as rep) {
+              <span class="inline-flex items-center space-x-1.5" [title]="rep.syncStatus.details">
+                <span
+                  class="w-2 h-2 rounded-full"
+                  [class.bg-[var(--color-positive)]]="rep.syncStatus.isFullyReconciled"
+                  [class.bg-[#A8752F]]="!rep.syncStatus.isFullyReconciled && rep.syncStatus.reconciledAccountsCount > 0"
+                  [class.bg-[var(--color-secondary)]]="rep.syncStatus.reconciledAccountsCount === 0"
+                ></span>
+                <span class="font-medium text-[var(--color-ink)]">{{ rep.syncStatus.statusLabel }}</span>
+              </span>
+            } @else {
+              <span class="inline-flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-[var(--color-secondary)]"></span>
+                <span>Connecting to ledger...</span>
+              </span>
+            }
             <button
               type="button"
               (click)="refreshDashboard()"
@@ -153,22 +165,33 @@ interface PeriodOption {
           </button>
         </div>
       } @else if (reportingState.report(); as rep) {
-        <!-- 1. NET WORTH HERO -->
+        <!-- 1. NET WORTH HERO (TRUTHFULLY RECONSTRUCTED AS OF EFFECTIVE DATE) -->
         <div class="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-2xl p-6 md:p-8 space-y-6">
           <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
             <div>
               <div class="flex items-center space-x-2 text-xs font-mono uppercase tracking-widest text-[var(--color-secondary)]">
                 <span>Primary Financial Position</span>
                 <span aria-hidden="true">·</span>
-                <span>All Active Ledgers</span>
+                @if (rep.netWorth.isHistoricalReconstruction) {
+                  <span class="text-[var(--color-accent)] font-semibold">
+                    Reconstructed as of {{ prettyDate(rep.netWorth.asOfDate) }}
+                  </span>
+                } @else {
+                  <span>Current Ledger Balance</span>
+                }
               </div>
               <h2 class="text-xs font-medium text-[var(--color-secondary)] mt-1 uppercase tracking-wider">
                 Total Net Worth
               </h2>
-              <div class="flex items-baseline space-x-3 mt-1">
+              <div class="flex flex-wrap items-baseline gap-3 mt-1">
                 <span class="font-editorial text-4xl md:text-5xl font-semibold tracking-tight text-[var(--color-ink)] tabular-nums">
                   {{ formatCurrency(rep.netWorth.totalNetWorth) }}
                 </span>
+                @if (rep.netWorth.isHistoricalReconstruction) {
+                  <span class="text-xs font-mono text-[var(--color-secondary)]">
+                    (Current Today: {{ formatCurrency(rep.netWorth.currentCashPosition) }})
+                  </span>
+                }
               </div>
               <p class="text-xs text-[var(--color-secondary)] mt-2 italic">
                 {{ rep.netWorth.disclaimer }}
@@ -186,7 +209,7 @@ interface PeriodOption {
             </button>
           </div>
 
-          <!-- Truthful Net Worth Breakdown (Distinguishing available vs unavailable components) -->
+          <!-- Truthful Net Worth Breakdown -->
           <div class="pt-4 border-t border-[var(--color-border)] grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
             <!-- Liquid Financial Assets -->
             <div class="p-3 rounded-xl bg-[var(--color-canvas)] border border-[var(--color-border)]/60">
@@ -196,7 +219,7 @@ interface PeriodOption {
               </span>
               <span class="text-[10px] text-[var(--color-positive)] font-medium mt-1 inline-flex items-center">
                 <mat-icon class="text-[12px] w-3 h-3 mr-0.5">check_circle</mat-icon>
-                Derived from active accounts
+                Reconstructed as of {{ prettyDate(rep.netWorth.asOfDate) }}
               </span>
             </div>
 
@@ -212,15 +235,23 @@ interface PeriodOption {
               </span>
             </div>
 
-            <!-- Liabilities -->
+            <!-- Liabilities (Truthfully derived from DEBT_BORROWING - DEBT_REPAYMENT) -->
             <div class="p-3 rounded-xl bg-[var(--color-canvas)] border border-[var(--color-border)]/60">
-              <span class="text-[11px] uppercase tracking-wider text-[var(--color-secondary)] block">All Liabilities</span>
-              <span class="font-mono text-base font-semibold text-[var(--color-secondary)] tabular-nums mt-0.5 block">
-                ₹0.00
+              <span class="text-[11px] uppercase tracking-wider text-[var(--color-secondary)] block">Recorded Liabilities</span>
+              <span
+                class="font-mono text-base font-semibold tabular-nums mt-0.5 block"
+                [class.text-[#B24C4C]]="rep.netWorth.liabilities > 0"
+                [class.text-[var(--color-ink)]]="rep.netWorth.liabilities === 0"
+              >
+                {{ formatCurrency(rep.netWorth.liabilities) }}
               </span>
-              <span class="text-[10px] text-[var(--color-secondary)] font-medium mt-1 inline-flex items-center">
-                <mat-icon class="text-[12px] w-3 h-3 mr-0.5 text-[var(--color-secondary)]">info_outline</mat-icon>
-                Zero debt recorded in ledger
+              <span
+                class="text-[10px] font-medium mt-1 inline-flex items-center"
+                [class.text-[#B24C4C]]="rep.netWorth.liabilities > 0"
+                [class.text-[var(--color-secondary)]]="rep.netWorth.liabilities === 0"
+              >
+                <mat-icon class="text-[12px] w-3 h-3 mr-0.5">{{ rep.netWorth.liabilities > 0 ? 'warning' : 'info_outline' }}</mat-icon>
+                {{ rep.netWorth.liabilities > 0 ? 'Active debt from ledger' : 'Zero debt recorded in ledger' }}
               </span>
             </div>
           </div>
@@ -489,7 +520,7 @@ interface PeriodOption {
                 Financial Composition
               </h3>
               <p class="text-xs text-[var(--color-secondary)] mt-0.5">
-                Current distribution across active bank and physical cash accounts.
+                Current distribution across active bank and physical cash accounts as of {{ prettyDate(rep.netWorth.asOfDate) }}.
               </p>
             </div>
             <a routerLink="/accounts" class="text-xs text-[var(--color-accent)] hover:underline inline-flex items-center space-x-1 font-medium">
@@ -503,7 +534,7 @@ interface PeriodOption {
             <div class="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-5 lg:col-span-2 space-y-4">
               <div class="flex items-center justify-between text-xs font-mono text-[var(--color-secondary)]">
                 <span>ACCOUNT NAME</span>
-                <span>BALANCE / SHARE</span>
+                <span>AS-OF BALANCE / SHARE</span>
               </div>
 
               <div class="divide-y divide-[var(--color-border)]">
@@ -521,9 +552,9 @@ interface PeriodOption {
                         </div>
                         <div class="text-[11px] text-[var(--color-secondary)]">
                           {{ acc.type === 'bank' ? (acc.institution || 'Bank Account') : 'Physical Cash' }}
-                          @if (acc.lastReconciledAt) {
+                          @if (acc.isReconciled) {
                             <span aria-hidden="true">·</span>
-                            <span>Reconciled</span>
+                            <span class="text-[var(--color-positive)] font-medium">Reconciled</span>
                           }
                         </div>
                       </div>
@@ -531,8 +562,13 @@ interface PeriodOption {
 
                     <div class="text-right">
                       <span class="font-mono text-sm font-bold text-[var(--color-ink)] tabular-nums block">
-                        {{ formatCurrency(acc.calculatedBalance) }}
+                        {{ formatCurrency(acc.asOfBalance) }}
                       </span>
+                      @if (rep.netWorth.isHistoricalReconstruction && acc.asOfBalance !== acc.calculatedBalance) {
+                        <span class="text-[10px] font-mono text-[var(--color-secondary)] block">
+                          Current: {{ formatCurrency(acc.calculatedBalance) }}
+                        </span>
+                      }
                       <span class="text-[11px] font-mono text-[var(--color-secondary)] block">
                         {{ acc.sharePercentage }}% of liquid cash
                       </span>
@@ -624,7 +660,7 @@ interface PeriodOption {
             </div>
           </div>
 
-          <!-- Monthly Trend Summary -->
+          <!-- Monthly Trend Summary (Taxes subtracted for true net savings) -->
           <div class="bg-[var(--color-surface)] border border-[var(--color-border)] rounded-xl p-6 space-y-4">
             <div class="flex items-center justify-between">
               <div>
@@ -632,7 +668,7 @@ interface PeriodOption {
                   Historical Monthly Trends
                 </h3>
                 <p class="text-xs text-[var(--color-secondary)] mt-0.5">
-                  Income vs Expenses trajectory across recent months.
+                  Income, taxes, and expenses trajectory across recent months.
                 </p>
               </div>
               <span class="text-xs font-mono text-[var(--color-secondary)]">Recent Months</span>
@@ -643,10 +679,14 @@ interface PeriodOption {
                 <div class="p-3 rounded-lg bg-[var(--color-canvas)] border border-[var(--color-border)]/60 text-xs flex items-center justify-between">
                   <div>
                     <span class="font-medium text-[var(--color-ink)]">{{ m.label }}</span>
-                    <div class="text-[11px] text-[var(--color-secondary)] space-x-2 mt-0.5">
-                      <span class="text-[var(--color-positive)] font-mono">+{{ formatCurrency(m.income) }}</span>
+                    <div class="text-[11px] text-[var(--color-secondary)] space-x-2 mt-0.5 flex flex-wrap items-center">
+                      <span class="text-[var(--color-positive)] font-mono">+{{ formatCurrency(m.grossIncome) }}</span>
+                      @if (m.netTaxPaid > 0) {
+                        <span aria-hidden="true">·</span>
+                        <span class="text-[#A8752F] font-mono">Tax: -{{ formatCurrency(m.netTaxPaid) }}</span>
+                      }
                       <span aria-hidden="true">·</span>
-                      <span class="text-[#B24C4C] font-mono">-{{ formatCurrency(m.expenses) }}</span>
+                      <span class="text-[#B24C4C] font-mono">Exp: -{{ formatCurrency(m.expenses) }}</span>
                     </div>
                   </div>
 
@@ -700,7 +740,7 @@ interface PeriodOption {
               </div>
             </div>
 
-            <!-- Indicator 2: Cash Runway / Emergency Buffer -->
+            <!-- Indicator 2: Cash Runway / Emergency Buffer (Consumption Expenses) -->
             <div class="p-4 rounded-xl bg-[var(--color-canvas)] border border-[var(--color-border)]/60 space-y-2">
               <span class="text-[11px] font-mono uppercase tracking-wider text-[var(--color-secondary)] block">2. Cash Runway</span>
               <div class="font-mono text-2xl font-bold text-[var(--color-ink)] tabular-nums">
@@ -712,7 +752,7 @@ interface PeriodOption {
               </div>
             </div>
 
-            <!-- Indicator 3: Debt Ratio -->
+            <!-- Indicator 3: Debt Ratio (Calculated from ledger obligations) -->
             <div class="p-4 rounded-xl bg-[var(--color-canvas)] border border-[var(--color-border)]/60 space-y-2">
               <span class="text-[11px] font-mono uppercase tracking-wider text-[var(--color-secondary)] block">3. Debt Ratio</span>
               <div class="font-mono text-2xl font-bold text-[var(--color-ink)] tabular-nums">
@@ -897,14 +937,12 @@ export class Home implements OnInit {
   });
 
   ngOnInit(): void {
-    // Default to 'financial_year' or 'current_month' as requested
     this.reportingState.loadReport('financial_year');
   }
 
   selectPeriod(period: ReportingPeriodType): void {
     if (period === 'custom') {
       this.reportingState.currentPeriod.set('custom');
-      // If dates already set, load report
       if (this.customRangeForm.valid) {
         this.applyCustomRange();
       }
@@ -927,5 +965,9 @@ export class Home implements OnInit {
 
   formatCurrency(minorUnits: number | null | undefined): string {
     return formatMinorUnits(minorUnits, 'INR');
+  }
+
+  prettyDate(isoStr?: string | null): string {
+    return isoStr ? formatPrettyDate(isoStr) : '';
   }
 }
