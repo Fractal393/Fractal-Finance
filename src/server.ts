@@ -1,10 +1,7 @@
-import {
-  createNodeRequestHandler,
-  isMainModule,
-} from '@angular/ssr/node';
 import express, { Request, Response } from 'express';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { authenticateToken, requireVerifiedEmail, AuthenticatedRequest } from './server/auth-middleware.js';
 import { getPinStatus, setPinVerifier, verifyUserPin } from './server/pin-service.js';
 import { getFirebaseAdmin } from './server/firebase-admin.js';
@@ -541,14 +538,13 @@ app.use((req, res, next) => {
 /**
  * Start the server if this module is the main entry point
  */
-if (isMainModule(import.meta.url) || process.env['pm_id']) {
+const isMain = process.argv[1] ? fileURLToPath(import.meta.url) === process.argv[1] : false;
+if (isMain || process.env['PORT'] || process.env['pm_id']) {
   const port = process.env['PORT'] || 4000;
   app.listen(port, () => {
     console.log(`Node Express server listening on http://localhost:${port}`);
   });
 }
 
-/**
- * Request handler used by the Angular CLI dev-server
- */
-export const reqHandler = createNodeRequestHandler(app);
+export const reqHandler = app;
+export default app;

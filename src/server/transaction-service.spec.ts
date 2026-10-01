@@ -108,7 +108,13 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                           } else if (f.op === '<=') {
                             if (!((docData[f.field] as string) <= (f.val as string))) { matches = false; break; }
                           } else if (f.op === 'array-contains') {
-                            const arr = (docData[f.field] as unknown[]) || [];
+                            let arr = (docData[f.field] as unknown[]) || [];
+                            if (f.field === 'categoryIds' && !arr.length) {
+                              arr = [
+                                docData['categoryId'],
+                                ...((docData['allocations'] as { categoryId: string }[]) || []).map((a) => a.categoryId),
+                              ].filter(Boolean);
+                            }
                             if (!arr.includes(f.val)) { matches = false; break; }
                           }
                         }
@@ -658,6 +664,101 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
       const incomeList = await getTransactions(USER_A, { type: 'INCOME' });
       expect(incomeList.items.length).toBe(1);
       expect(incomeList.items[0].description).toBe('Salary Bonus');
+    });
+
+    it('correctly filters transactions by split-transaction allocation categories', async () => {
+      // Create single category transaction
+      await createTransaction(USER_A, {
+        accountId: 'acc_checking',
+        transactionDate: '2026-03-01',
+        amount: 200000,
+        type: 'INCOME',
+        categoryId: 'cat_salary',
+        description: 'Base Salary',
+      });
+
+      // Create split transaction where categoryId is not top-level but in allocations
+      const splitTx = await createTransaction(USER_A, {
+        accountId: 'acc_checking',
+        transactionDate: '2026-03-02',
+        amount: 300000,
+        type: 'EXPENSE',
+        description: 'Mall Department Shopping',
+        allocations: [
+          { categoryId: 'cat_groceries', amount: 180000, notes: 'Organic market' },
+          { categoryId: 'cat_food', amount: 120000, notes: 'Food court' },
+        ],
+      });
+
+      // 1. Querying by cat_groceries must return the split transaction
+      const groceriesList = await getTransactions(USER_A, { categoryId: 'cat_groceries' });
+      expect(groceriesList.items.some((t) => t.id === splitTx.id)).toBe(true);
+
+      // 2. Querying by cat_food must return the split transaction
+      const foodList = await getTransactions(USER_A, { categoryId: 'cat_food' });
+      expect(foodList.items.some((t) => t.id === splitTx.id)).toBe(true);
+
+      // 3. Querying by cat_salary must NOT return the split transaction
+      const salaryList = await getTransactions(USER_A, { categoryId: 'cat_salary' });
+      expect(salaryList.items.some((t) => t.id === splitTx.id)).toBe(false);
+      expect(salaryList.items.length).toBe(1);
+      expect(salaryList.items[0].description).toBe('Base Salary');
+    });
+
+    it('correctly paginates free-text search results with proper cursor and hasMore semantics', async () => {
+      // Create a sequence of transactions where only some match "cloud server"
+      const createdMatchingIds: string[] = [];
+      for (let i = 1; i <= 6; i++) {
+        // Interleaving matching and non-matching records
+        const matchTx = await createTransaction(USER_A, {
+          accountId: 'acc_checking',
+          transactionDate: `2026-03-${String(10 + i).padStart(2, '0')}`,
+          amount: 50000 + i * 1000,
+          type: 'EXPENSE',
+          description: `Monthly cloud server tier ${i}`,
+        });
+        createdMatchingIds.push(matchTx.id);
+
+        await createTransaction(USER_A, {
+          accountId: 'acc_checking',
+          transactionDate: `2026-03-${String(10 + i).padStart(2, '0')}`,
+          amount: 20000,
+          type: 'EXPENSE',
+          description: `Office stationary item ${i}`,
+        });
+      }
+
+      // Page 1: search "cloud server" with limit 3
+      const page1 = await getTransactions(USER_A, {
+        search: 'cloud server',
+        limit: 3,
+      });
+
+      expect(page1.items.length).toBe(3);
+      expect(page1.hasMore).toBe(true);
+      expect(page1.nextCursor).toBeDefined();
+
+      for (const item of page1.items) {
+        expect(item.description.toLowerCase()).toContain('cloud server');
+      }
+
+      // Page 2: search "cloud server" with limit 3 using cursor from page 1
+      const page2 = await getTransactions(USER_A, {
+        search: 'cloud server',
+        limit: 3,
+        cursor: page1.nextCursor!,
+      });
+
+      expect(page2.items.length).toBe(3);
+      for (const item of page2.items) {
+        expect(item.description.toLowerCase()).toContain('cloud server');
+      }
+
+      // Invariant: Zero duplicate IDs between Page 1 and Page 2
+      const page1Ids = new Set(page1.items.map((t) => t.id));
+      for (const item of page2.items) {
+        expect(page1Ids.has(item.id)).toBe(false);
+      }
     });
   });
 

@@ -270,6 +270,14 @@ export async function createTransaction(
   const now = new Date().toISOString();
   const balanceDelta = getTransactionBalanceDelta(input.type, input.amount, 'POSTED');
 
+  const categoryIds = Array.from(
+    new Set(
+      [input.categoryId, ...allocations.map((a) => a.categoryId)].filter(
+        (c): c is string => typeof c === 'string' && c.length > 0,
+      ),
+    ),
+  );
+
   const newTx: TransactionDocument = {
     id: txId,
     userId,
@@ -278,6 +286,7 @@ export async function createTransaction(
     amount: input.amount,
     type: input.type,
     categoryId: input.categoryId || null,
+    categoryIds,
     counterpartyId: input.counterpartyId || null,
     description: input.description.trim(),
     tags: Array.isArray(input.tags) ? input.tags.map((t) => t.trim().toLowerCase()) : [],
@@ -600,6 +609,18 @@ export async function updateTransaction(
     allocationsChanged = true;
   }
 
+  if (input.allocations !== undefined || input.categoryId !== undefined) {
+    const activeCat = input.categoryId !== undefined ? input.categoryId : current.categoryId;
+    const activeAllocs = input.allocations !== undefined ? updates.allocations || [] : current.allocations || [];
+    updates.categoryIds = Array.from(
+      new Set(
+        [activeCat, ...activeAllocs.map((a) => a.categoryId)].filter(
+          (c): c is string => typeof c === 'string' && c.length > 0,
+        ),
+      ),
+    );
+  }
+
   // If part of an internal transfer group, edit both legs and balances atomically
   if (current.transferGroupId) {
     if (input.type !== undefined && input.type !== 'INTERNAL_TRANSFER') {
@@ -918,7 +939,7 @@ export async function getTransactions(
     query = query.where('counterpartyId', '==', params.counterpartyId);
   }
   if (params.categoryId) {
-    query = query.where('categoryId', '==', params.categoryId);
+    query = query.where('categoryIds', 'array-contains', params.categoryId);
   }
   if (params.tag) {
     const normalizedTag = params.tag.trim().toLowerCase();
@@ -936,6 +957,89 @@ export async function getTransactions(
 
   const limit = Math.min(Math.max(params.limit || 25, 1), 100);
 
+  // Free-text search pagination semantics
+  if (params.search && params.search.trim().length > 0) {
+    const q = params.search.trim().toLowerCase();
+    const matchedItems: TransactionDocument[] = [];
+    let currentCursorSnap: FirebaseFirestore.DocumentSnapshot | null = null;
+
+    if (params.cursor) {
+      const cursorRef = col.doc(params.cursor);
+      const cursorSnap = await cursorRef.get();
+      if (cursorSnap.exists) {
+        currentCursorSnap = cursorSnap;
+      }
+    }
+
+    let hasMoreToFetch = true;
+    let lastEvaluatedDoc: FirebaseFirestore.DocumentSnapshot | null = null;
+    let totalScanned = 0;
+    const batchSize = Math.max(limit * 2, 50);
+    const maxScanLimit = 1000;
+
+    let hasMore = false;
+
+    while (matchedItems.length < limit && hasMoreToFetch && totalScanned < maxScanLimit) {
+      let batchQuery = query.limit(batchSize + 1);
+      if (currentCursorSnap) {
+        batchQuery = batchQuery.startAfter(currentCursorSnap);
+      }
+
+      const batchSnap = await batchQuery.get();
+      const batchDocs = batchSnap.docs;
+
+      if (batchDocs.length === 0) {
+        hasMoreToFetch = false;
+        break;
+      }
+
+      const hasNextInBatch = batchDocs.length > batchSize;
+      const docsToProcess = hasNextInBatch ? batchDocs.slice(0, batchSize) : batchDocs;
+      totalScanned += docsToProcess.length;
+
+      let stoppedEarlyInBatch = false;
+      for (let i = 0; i < docsToProcess.length; i++) {
+        const doc = docsToProcess[i];
+        lastEvaluatedDoc = doc;
+        const data = doc.data() as TransactionDocument;
+        const desc = data.description ? data.description.toLowerCase() : '';
+        const notes = data.notes ? data.notes.toLowerCase() : '';
+        if (desc.includes(q) || notes.includes(q)) {
+          matchedItems.push(data);
+          if (matchedItems.length === limit) {
+            stoppedEarlyInBatch = i < docsToProcess.length - 1;
+            break;
+          }
+        }
+      }
+
+      if (stoppedEarlyInBatch || hasNextInBatch) {
+        hasMore = true;
+      } else {
+        hasMore = false;
+      }
+
+      if (matchedItems.length >= limit) {
+        break;
+      }
+
+      if (!hasNextInBatch) {
+        hasMoreToFetch = false;
+      } else {
+        currentCursorSnap = lastEvaluatedDoc;
+      }
+    }
+
+    const nextCursor = hasMore && lastEvaluatedDoc ? lastEvaluatedDoc.id : null;
+
+    return {
+      items: matchedItems,
+      nextCursor,
+      hasMore,
+    };
+  }
+
+  // Standard non-search cursor query (O(limit))
   if (params.cursor) {
     const cursorRef = col.doc(params.cursor);
     const cursorSnap = await cursorRef.get();
@@ -950,17 +1054,7 @@ export async function getTransactions(
   const docs = snap.docs;
   const hasMore = docs.length > limit;
   const pageDocs = hasMore ? docs.slice(0, limit) : docs;
-  let items: TransactionDocument[] = pageDocs.map((doc) => doc.data() as TransactionDocument);
-
-  if (params.search && params.search.trim().length > 0) {
-    const q = params.search.trim().toLowerCase();
-    items = items.filter(
-      (t) =>
-        t.description.toLowerCase().includes(q) ||
-        (t.notes && t.notes.toLowerCase().includes(q)),
-    );
-  }
-
+  const items: TransactionDocument[] = pageDocs.map((doc) => doc.data() as TransactionDocument);
   const nextCursor = hasMore && pageDocs.length > 0 ? pageDocs[pageDocs.length - 1].id : null;
 
   return {
