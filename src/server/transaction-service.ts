@@ -7,6 +7,11 @@ import {
   getTransactionBalanceDelta,
 } from './reporting-semantics.js';
 import { AccountDocument } from './account-service.js';
+import {
+  recordTransactionCreatedInProjection,
+  recordTransactionVoidedInProjection,
+  recordTransactionUpdatedInProjection,
+} from './projection-service.js';
 
 export interface SplitAllocation {
   id: string;
@@ -332,6 +337,11 @@ export async function createTransaction(
     },
   });
 
+  // Non-blocking projection sync
+  recordTransactionCreatedInProjection(userId, newTx).catch((err: unknown) => {
+    void err;
+  });
+
   return newTx;
 }
 
@@ -485,6 +495,14 @@ export async function createInternalTransfer(
       sourceTxId: sourceTx.id,
       destTxId: destTx.id,
     },
+  });
+
+  // Non-blocking projection sync
+  recordTransactionCreatedInProjection(userId, sourceTx).catch((err: unknown) => {
+    void err;
+  });
+  recordTransactionCreatedInProjection(userId, destTx).catch((err: unknown) => {
+    void err;
   });
 
   return { sourceTransaction: sourceTx, destinationTransaction: destTx };
@@ -732,6 +750,11 @@ export async function updateTransaction(
 
   const updatedTx: TransactionDocument = { ...current, ...updates };
 
+  // Non-blocking projection sync
+  recordTransactionUpdatedInProjection(userId, current, updatedTx).catch((err: unknown) => {
+    void err;
+  });
+
   await createAuditRecord({
     userId,
     actor: userId,
@@ -820,6 +843,15 @@ export async function voidTransaction(
       }
     });
 
+    // Non-blocking projection sync for voided transfer legs
+    for (const tDoc of transferDocs) {
+      if (tDoc.status !== 'VOIDED') {
+        recordTransactionVoidedInProjection(userId, tDoc).catch((err: unknown) => {
+          void err;
+        });
+      }
+    }
+
     await createAuditRecord({
       userId,
       actor: userId,
@@ -870,6 +902,11 @@ export async function voidTransaction(
     voidReason,
     updatedAt: now,
   };
+
+  // Non-blocking projection sync
+  recordTransactionVoidedInProjection(userId, current).catch((err: unknown) => {
+    void err;
+  });
 
   await createAuditRecord({
     userId,

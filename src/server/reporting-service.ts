@@ -3,6 +3,7 @@ import type { AccountDocument } from './account-service.js';
 import type { TransactionDocument } from './transaction-service.js';
 import type { CategoryDocument } from './metadata-service.js';
 import { getTransactionBalanceDelta } from './reporting-semantics.js';
+import { getOrBuildProjection } from './projection-service.js';
 
 export type ReportingPeriodType =
   | 'current_month'
@@ -403,6 +404,9 @@ export async function getDashboardReport(
   const isHistorical = resolvedRange.endDate < todayDateStr && resolvedRange.period !== 'all_history';
   const asOfDate = isHistorical ? resolvedRange.endDate : todayDateStr;
 
+  // Load derived rebuildable projection (O(1) read, separate from canonical ledger)
+  const projection = await getOrBuildProjection(userId);
+
   // 1. Fetch all accounts for user
   const accountsSnap = await db
     .collection('users')
@@ -525,31 +529,35 @@ export async function getDashboardReport(
     }
   }
 
-  // Query C: Debt borrowings and repayments on or before asOfDate for truthful liability calculation
-  let cumulativeDebtBorrowing = 0;
-  let cumulativeDebtRepayment = 0;
+  // Debt calculation:
+  // For current position (today): O(1) from projection without scanning ledger
+  // For historical position (asOfDate < today): subtract only subsequent debt movements occurring strictly after asOfDate
+  let cumulativeDebtBorrowing = projection.debt.cumulativeDebtBorrowing;
+  let cumulativeDebtRepayment = projection.debt.cumulativeDebtRepayment;
 
-  // Query all posted debt movements
-  const debtBorrowSnap = await txCol
-    .where('status', '==', 'POSTED')
-    .where('type', '==', 'DEBT_BORROWING')
-    .get();
-  for (const doc of debtBorrowSnap.docs) {
-    const tx = doc.data() as TransactionDocument;
-    if (tx.transactionDate <= asOfDate) {
-      cumulativeDebtBorrowing += tx.amount;
+  if (isHistorical) {
+    const subsequentDebtBorrow = await txCol
+      .where('status', '==', 'POSTED')
+      .where('type', '==', 'DEBT_BORROWING')
+      .where('transactionDate', '>', asOfDate)
+      .get();
+    let laterBorrowing = 0;
+    for (const doc of subsequentDebtBorrow.docs) {
+      laterBorrowing += (doc.data() as TransactionDocument).amount;
     }
-  }
 
-  const debtRepaySnap = await txCol
-    .where('status', '==', 'POSTED')
-    .where('type', '==', 'DEBT_REPAYMENT')
-    .get();
-  for (const doc of debtRepaySnap.docs) {
-    const tx = doc.data() as TransactionDocument;
-    if (tx.transactionDate <= asOfDate) {
-      cumulativeDebtRepayment += tx.amount;
+    const subsequentDebtRepay = await txCol
+      .where('status', '==', 'POSTED')
+      .where('type', '==', 'DEBT_REPAYMENT')
+      .where('transactionDate', '>', asOfDate)
+      .get();
+    let laterRepayment = 0;
+    for (const doc of subsequentDebtRepay.docs) {
+      laterRepayment += (doc.data() as TransactionDocument).amount;
     }
+
+    cumulativeDebtBorrowing = Math.max(0, projection.debt.cumulativeDebtBorrowing - laterBorrowing);
+    cumulativeDebtRepayment = Math.max(0, projection.debt.cumulativeDebtRepayment - laterRepayment);
   }
 
   const outstandingDebtLiability = Math.max(0, cumulativeDebtBorrowing - cumulativeDebtRepayment);
@@ -755,47 +763,14 @@ export async function getDashboardReport(
     Math.max(0, -reconciliationAdjustments);
   const netMovement = totalInflows - totalOutflows;
 
-  // 6. Query Lifetime & Monthly Trends Transactions
-  // When period is all_history, allPostedTransactions is already periodTransactions.
-  // Otherwise, query posted transactions using status index to exclude draft/void transactions.
-  let allPostedTransactions: TransactionDocument[] = [];
-  if (resolvedRange.period === 'all_history') {
-    allPostedTransactions = periodTransactions;
-  } else {
-    const allPostedSnap = await txCol.where('status', '==', 'POSTED').get();
-    allPostedTransactions = allPostedSnap.docs.map((d) => d.data() as TransactionDocument);
-  }
-
-  let lifetimeGrossIncome = 0;
-  let lifetimeNetTaxPaid = 0;
-  let lifetimeConsumptionExpenses = 0;
-  let lifetimeNonFinancialAssetPurchases = 0;
-  let lifetimeInvestmentAllocation = 0;
-  let earliestTransactionDate: string | null = null;
-
-  for (const tx of allPostedTransactions) {
-    if (!earliestTransactionDate || tx.transactionDate < earliestTransactionDate) {
-      earliestTransactionDate = tx.transactionDate;
-    }
-
-    switch (tx.type) {
-      case 'INCOME':
-        lifetimeGrossIncome += tx.amount;
-        break;
-      case 'TAX':
-        lifetimeNetTaxPaid += tx.amount;
-        break;
-      case 'EXPENSE':
-        lifetimeConsumptionExpenses += tx.amount;
-        break;
-      case 'NON_FINANCIAL_ASSET_PURCHASE':
-        lifetimeNonFinancialAssetPurchases += tx.amount;
-        break;
-      case 'INVESTMENT_ALLOCATION':
-        lifetimeInvestmentAllocation += tx.amount;
-        break;
-    }
-  }
+  // 6. Lifetime Summary (Derived from Projection - O(1) without scanning ledger)
+  const lifetimeGrossIncome = projection.lifetime.grossIncome;
+  const lifetimeNetTaxPaid = projection.lifetime.netTaxPaid;
+  const lifetimeConsumptionExpenses = projection.lifetime.consumptionExpenses;
+  const lifetimeNonFinancialAssetPurchases = projection.lifetime.nonFinancialAssetPurchases;
+  const lifetimeInvestmentAllocation = projection.lifetime.investmentAllocation;
+  const totalPostedTransactions = projection.lifetime.totalPostedTransactions;
+  const earliestTransactionDate = projection.lifetime.earliestTransactionDate;
 
   const lifetimeTotalExpenses = lifetimeConsumptionExpenses + lifetimeNonFinancialAssetPurchases;
   const lifetimeNetIncome = lifetimeGrossIncome - lifetimeNetTaxPaid;
@@ -926,10 +901,16 @@ export async function getDashboardReport(
   const twelveMonthsAgoDate = new Date(refYear, refMonth - 11, 1);
   const twelveMonthsAgoStr = `${twelveMonthsAgoDate.getFullYear()}-${String(twelveMonthsAgoDate.getMonth() + 1).padStart(2, '0')}-01`;
 
-  const trendTransactions =
-    resolvedRange.period === 'last_12_months'
-      ? periodTransactions
-      : allPostedTransactions.filter((t) => t.transactionDate >= twelveMonthsAgoStr);
+  let trendTransactions: TransactionDocument[] = [];
+  if (resolvedRange.period === 'last_12_months') {
+    trendTransactions = periodTransactions;
+  } else {
+    const trendsSnap = await txCol
+      .where('status', '==', 'POSTED')
+      .where('transactionDate', '>=', twelveMonthsAgoStr)
+      .get();
+    trendTransactions = trendsSnap.docs.map((d) => d.data() as TransactionDocument);
+  }
 
   for (const tx of trendTransactions) {
     if (tx.transactionDate.length >= 7) {
@@ -1087,7 +1068,7 @@ export async function getDashboardReport(
       lifetimeTotalExpenses,
       lifetimeSavings,
       lifetimeInvestmentAllocation,
-      totalPostedTransactions: allPostedTransactions.length,
+      totalPostedTransactions,
       totalActiveAccounts: activeAccounts.length,
       earliestTransactionDate,
       disclaimer: 'Based on available data',

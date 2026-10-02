@@ -1,7 +1,11 @@
 import express, { Request, Response } from 'express';
 import { join } from 'node:path';
-import { existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import {
+  AngularNodeAppEngine,
+  createNodeRequestHandler,
+  isMainModule,
+  writeResponseToNodeResponse,
+} from '@angular/ssr/node';
 import { authenticateToken, requireVerifiedEmail, AuthenticatedRequest } from './server/auth-middleware.js';
 import { getPinStatus, setPinVerifier, verifyUserPin } from './server/pin-service.js';
 import { getFirebaseAdmin } from './server/firebase-admin.js';
@@ -41,10 +45,15 @@ import {
   validateISODate,
   VALID_PERIOD_TYPES,
 } from './server/reporting-service.js';
+import {
+  rebuildProjectionFromLedger,
+  verifyProjectionConsistency,
+} from './server/projection-service.js';
 
 const browserDistFolder = join(import.meta.dirname, '../browser');
 
 const app = express();
+const angularApp = new AngularNodeAppEngine();
 app.use(express.json());
 
 // Initialize Firebase Admin SDK early
@@ -580,8 +589,43 @@ app.get('/api/reports/dashboard', authenticateToken, requireVerifiedEmail, async
     });
     res.json(report);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Failed to generate dashboard report';
-    res.status(400).json({ error: 'DASHBOARD_REPORT_FAILED', message });
+    console.error('Unexpected error in /api/reports/dashboard:', err);
+    const message = err instanceof Error ? err.message : 'Internal error generating dashboard report';
+    res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message });
+  }
+});
+
+/**
+ * POST /api/reports/dashboard/rebuild-projection: Deterministically recalculates the
+ * dashboard summary projection from the canonical transaction ledger.
+ */
+app.post('/api/reports/dashboard/rebuild-projection', authenticateToken, requireVerifiedEmail, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const projection = await rebuildProjectionFromLedger(req.user!.uid);
+    res.json({
+      success: true,
+      message: 'Dashboard projection rebuilt successfully from canonical ledger.',
+      projection,
+    });
+  } catch (err: unknown) {
+    console.error('Failed to rebuild projection:', err);
+    const message = err instanceof Error ? err.message : 'Failed to rebuild projection';
+    res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message });
+  }
+});
+
+/**
+ * GET /api/reports/dashboard/projection-status: Verifies that the stored projection
+ * is 100% consistent with the canonical transaction ledger.
+ */
+app.get('/api/reports/dashboard/projection-status', authenticateToken, requireVerifiedEmail, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const verification = await verifyProjectionConsistency(req.user!.uid);
+    res.json(verification);
+  } catch (err: unknown) {
+    console.error('Failed to verify projection consistency:', err);
+    const message = err instanceof Error ? err.message : 'Failed to verify projection consistency';
+    res.status(500).json({ error: 'INTERNAL_SERVER_ERROR', message });
   }
 });
 
@@ -597,7 +641,7 @@ app.use(
 );
 
 /**
- * Handle all other non-API routes by serving the client SPA index.html
+ * Handle all other non-API routes by rendering the Angular application
  */
 app.use((req, res, next) => {
   if (req.path.startsWith('/api')) {
@@ -605,24 +649,23 @@ app.use((req, res, next) => {
     return;
   }
 
-  const indexPath = join(browserDistFolder, 'index.html');
-  if (existsSync(indexPath)) {
-    res.sendFile(indexPath);
-  } else {
-    next();
-  }
+  angularApp
+    .handle(req)
+    .then((response) =>
+      response ? writeResponseToNodeResponse(response, res) : next(),
+    )
+    .catch(next);
 });
 
 /**
  * Start the server if this module is the main entry point
  */
-const isMain = process.argv[1] ? fileURLToPath(import.meta.url) === process.argv[1] : false;
-if (isMain || process.env['PORT'] || process.env['pm_id']) {
-  const port = process.env['PORT'] || 4000;
+if (isMainModule(import.meta.url)) {
+  const port = process.env['PORT'] || 3000;
   app.listen(port, () => {
     console.log(`Node Express server listening on http://localhost:${port}`);
   });
 }
 
-export const reqHandler = app;
+export const reqHandler = createNodeRequestHandler(app);
 export default app;

@@ -121,6 +121,7 @@ describe('Reporting Service & Period Semantics', () => {
     let accountsStore: Map<string, AccountDocument>;
     let categoriesStore: Map<string, CategoryDocument>;
     let transactionsStore: Map<string, TransactionDocument>;
+    let projectionsStore: Map<string, Record<string, unknown>>;
 
     interface MockFilter {
       field: string;
@@ -187,6 +188,7 @@ describe('Reporting Service & Period Semantics', () => {
       accountsStore = new Map();
       categoriesStore = new Map();
       transactionsStore = new Map();
+      projectionsStore = new Map();
 
       const mockDb = {
         collection: (colName: string) => {
@@ -217,6 +219,26 @@ describe('Reporting Service & Period Semantics', () => {
                   }
                   if (subCol === 'transactions') {
                     return createQueryBuilder();
+                  }
+                  if (subCol === 'projections') {
+                    return {
+                      doc: (docId: string) => ({
+                        get: async () => {
+                          const data = projectionsStore.get(`${docUserId}/${docId}`);
+                          return {
+                            exists: !!data,
+                            data: () => data,
+                          };
+                        },
+                        set: async (val: Record<string, unknown>) => {
+                          projectionsStore.set(`${docUserId}/${docId}`, val);
+                        },
+                        update: async (val: Record<string, unknown>) => {
+                          const existing = projectionsStore.get(`${docUserId}/${docId}`) || {};
+                          projectionsStore.set(`${docUserId}/${docId}`, { ...existing, ...val });
+                        },
+                      }),
+                    };
                   }
                   return {
                     get: async () => ({ empty: true, docs: [] }),
@@ -571,6 +593,146 @@ describe('Reporting Service & Period Semantics', () => {
       expect(report.syncStatus.unreconciledAccountsCount).toBe(1);
       expect(report.syncStatus.isFullyReconciled).toBe(false);
       expect(report.syncStatus.statusLabel).toBe('1 of 2 accounts reconciled');
+    });
+
+    it('bounds monthly trends to rolling 12-month window, excluding older history from trend buckets', async () => {
+      accountsStore.set('acc-1', {
+        id: 'acc-1',
+        userId,
+        name: 'Savings',
+        type: 'bank',
+        institution: 'Bank',
+        currency: 'INR',
+        openingBalance: 1000000,
+        openingBalanceDate: '2025-01-01',
+        calculatedBalance: 1000000,
+        isActive: true,
+        createdAt: '2025-01-01T00:00:00Z',
+        updatedAt: '2026-10-01T00:00:00Z',
+      });
+
+      // 1. Transaction 16 months ago (June 2025)
+      transactionsStore.set('tx-old', {
+        id: 'tx-old',
+        userId,
+        accountId: 'acc-1',
+        amount: 5000000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: '2025-06-15',
+        description: 'Old Salary',
+        allocations: [],
+        createdAt: '2025-06-15T00:00:00Z',
+        updatedAt: '2025-06-15T00:00:00Z',
+      });
+
+      // 2. Transaction within rolling 12 months (May 2026)
+      transactionsStore.set('tx-recent', {
+        id: 'tx-recent',
+        userId,
+        accountId: 'acc-1',
+        amount: 8000000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: '2026-05-15',
+        description: 'Recent Salary',
+        allocations: [],
+        createdAt: '2026-05-15T00:00:00Z',
+        updatedAt: '2026-05-15T00:00:00Z',
+      });
+
+      const report = await getDashboardReport(userId, {
+        period: 'current_month',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+
+      // Monthly trends should contain May 2026 but NOT June 2025 (which is outside 12-month window)
+      const trendKeys = report.monthlyTrends.map((m) => m.monthKey);
+      expect(trendKeys).toContain('2026-05');
+      expect(trendKeys).not.toContain('2025-06');
+
+      // But lifetime summary must truthfully include the old transaction
+      expect(report.lifetimeSummary.lifetimeGrossIncome).toBe(13000000); // 50,000 + 80,000 = ₹1,30,000
+    });
+
+    it('correctly calculates historical debt by subtracting only post-asOfDate debt movements', async () => {
+      accountsStore.set('acc-1', {
+        id: 'acc-1',
+        userId,
+        name: 'Savings',
+        type: 'bank',
+        institution: 'Bank',
+        currency: 'INR',
+        openingBalance: 10000000,
+        calculatedBalance: 10000000,
+        isActive: true,
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-10-01T00:00:00Z',
+      });
+
+      // Borrowing in Feb 2026: ₹40,000 (4,000,000 paise)
+      transactionsStore.set('tx-b1', {
+        id: 'tx-b1',
+        userId,
+        accountId: 'acc-1',
+        amount: 4000000,
+        type: 'DEBT_BORROWING',
+        status: 'POSTED',
+        transactionDate: '2026-02-10',
+        description: 'First Loan',
+        allocations: [],
+        createdAt: '2026-02-10T00:00:00Z',
+        updatedAt: '2026-02-10T00:00:00Z',
+      });
+
+      // Borrowing in August 2026: ₹60,000 (6,000,000 paise)
+      transactionsStore.set('tx-b2', {
+        id: 'tx-b2',
+        userId,
+        accountId: 'acc-1',
+        amount: 6000000,
+        type: 'DEBT_BORROWING',
+        status: 'POSTED',
+        transactionDate: '2026-08-10',
+        description: 'Second Loan',
+        allocations: [],
+        createdAt: '2026-08-10T00:00:00Z',
+        updatedAt: '2026-08-10T00:00:00Z',
+      });
+
+      // Repayment in September 2026: ₹10,000 (1,000,000 paise)
+      transactionsStore.set('tx-r1', {
+        id: 'tx-r1',
+        userId,
+        accountId: 'acc-1',
+        amount: 1000000,
+        type: 'DEBT_REPAYMENT',
+        status: 'POSTED',
+        transactionDate: '2026-09-15',
+        description: 'EMI',
+        allocations: [],
+        createdAt: '2026-09-15T00:00:00Z',
+        updatedAt: '2026-09-15T00:00:00Z',
+      });
+
+      // 1. Current report (as of Oct 15, 2026):
+      // Cumulative borrowing = 40,000 + 60,000 = ₹1,00,000. Repayment = ₹10,000. Net liability = ₹90,000 (9,000,000 paise)
+      const currentReport = await getDashboardReport(userId, {
+        period: 'current_month',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+      expect(currentReport.netWorth.liabilities).toBe(9000000);
+
+      // 2. Historical report as of May 31, 2026:
+      // At this time, only the Feb 2026 borrowing (₹40,000) had occurred.
+      // Second loan (Aug) and EMI (Sep) occurred after May 31 and should be subtracted.
+      const historicalReport = await getDashboardReport(userId, {
+        period: 'custom',
+        startDate: '2026-05-01',
+        endDate: '2026-05-31',
+        referenceDate: new Date('2026-10-15T12:00:00Z'),
+      });
+      expect(historicalReport.netWorth.liabilities).toBe(4000000); // Exactly ₹40,000
     });
   });
 });

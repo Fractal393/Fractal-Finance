@@ -34,6 +34,7 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
       counterparties: new Map(),
       tags: new Map(),
       audit: new Map(),
+      projections: new Map(),
     };
 
     let docIdCounter = 1;
@@ -51,6 +52,7 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                   if (subColName === 'counterparties') return mockStore.counterparties;
                   if (subColName === 'tags') return mockStore.tags;
                   if (subColName === 'audit') return mockStore.audit;
+                  if (subColName === 'projections') return mockStore.projections;
                   throw new Error(`Unexpected subcollection ${subColName}`);
                 };
 

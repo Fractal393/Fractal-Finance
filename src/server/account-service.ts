@@ -2,6 +2,7 @@ import { getFirebaseAdmin } from './firebase-admin.js';
 import { createAuditRecord } from './audit-service.js';
 import type { TransactionDocument } from './transaction-service.js';
 import { getTransactionBalanceDelta } from './reporting-semantics.js';
+import { recordTransactionCreatedInProjection } from './projection-service.js';
 
 export type AccountType = 'bank' | 'cash';
 
@@ -507,6 +508,12 @@ export async function reconcileAccount(
     };
   }).then(async (result) => {
     // Audit after atomic transaction commit
+    if (result.adjustmentApplied && result.adjustmentTransaction) {
+      recordTransactionCreatedInProjection(userId, result.adjustmentTransaction).catch((err: unknown) => {
+        void err;
+      });
+    }
+
     if (result.adjustmentApplied) {
       await createAuditRecord({
         userId,

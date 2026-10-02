@@ -57,6 +57,11 @@ service cloud.firestore {
         allow write: if false;
       }
 
+      match /projections/{projectionId} {
+        allow read: if isOwner(userId) && isEmailVerified();
+        allow write: if false;
+      }
+
       match /transactions/{transactionId} {
         allow read: if isOwner(userId) && isEmailVerified();
         allow write: if false;
