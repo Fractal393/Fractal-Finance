@@ -19,6 +19,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
     snapshots: Map<string, Record<string, unknown>>;
     transactions: Map<string, Record<string, unknown>>;
     audit: Map<string, Record<string, unknown>>;
+    projections: Map<string, Record<string, unknown>>;
   };
 
   const USER_A = 'user-alpha-123';
@@ -30,6 +31,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
       snapshots: new Map(),
       transactions: new Map(),
       audit: new Map(),
+      projections: new Map(),
     };
 
     let docIdCounter = 1;
@@ -46,6 +48,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
                   if (subColName === 'balanceSnapshots') return mockStore.snapshots;
                   if (subColName === 'transactions') return mockStore.transactions;
                   if (subColName === 'audit') return mockStore.audit;
+                  if (subColName === 'projections') return mockStore.projections;
                   throw new Error(`Unexpected subcollection ${subColName}`);
                 };
 
@@ -61,8 +64,13 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
                           data: () => data,
                         };
                       },
-                      set: async (val: Record<string, unknown>) => {
-                        getStore().set(`${userId}/${id}`, { ...val, id });
+                      set: async (val: Record<string, unknown>, opts?: { merge?: boolean }) => {
+                        if (opts?.merge) {
+                          const existing = getStore().get(`${userId}/${id}`) || {};
+                          getStore().set(`${userId}/${id}`, { ...existing, ...val, id });
+                        } else {
+                          getStore().set(`${userId}/${id}`, { ...val, id });
+                        }
                       },
                       update: async (val: Record<string, unknown>) => {
                         const existing = getStore().get(`${userId}/${id}`);
@@ -107,7 +115,7 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
       runTransaction: async (updateFunction: (transaction: unknown) => Promise<unknown>) => {
         const transaction = {
           get: async (ref: { get: () => Promise<unknown> }) => ref.get(),
-          set: (ref: { set: (v: Record<string, unknown>) => Promise<void> }, data: Record<string, unknown>) => ref.set(data),
+          set: (ref: { set: (v: Record<string, unknown>, opts?: Record<string, unknown>) => Promise<void> }, data: Record<string, unknown>, opts?: Record<string, unknown>) => ref.set(data, opts),
           update: (ref: { update: (v: Record<string, unknown>) => Promise<void> }, data: Record<string, unknown>) => ref.update(data),
         };
         return updateFunction(transaction);

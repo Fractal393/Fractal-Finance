@@ -11,6 +11,9 @@ import {
   recordTransactionCreatedInProjection,
   recordTransactionVoidedInProjection,
   recordTransactionUpdatedInProjection,
+  recordInternalTransferCreatedInProjection,
+  recordTransactionsVoidedInProjection,
+  markProjectionStale,
 } from './projection-service.js';
 
 export interface SplitAllocation {
@@ -337,10 +340,16 @@ export async function createTransaction(
     },
   });
 
-  // Non-blocking projection sync
-  recordTransactionCreatedInProjection(userId, newTx).catch((err: unknown) => {
-    void err;
-  });
+  // Atomic projection sync with reliable failure recovery
+  try {
+    await recordTransactionCreatedInProjection(userId, newTx);
+  } catch (err: unknown) {
+    console.error('Failed to update projection on transaction creation:', err);
+    await markProjectionStale(
+      userId,
+      `CREATE_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   return newTx;
 }
@@ -497,13 +506,16 @@ export async function createInternalTransfer(
     },
   });
 
-  // Non-blocking projection sync
-  recordTransactionCreatedInProjection(userId, sourceTx).catch((err: unknown) => {
-    void err;
-  });
-  recordTransactionCreatedInProjection(userId, destTx).catch((err: unknown) => {
-    void err;
-  });
+  // Atomic paired projection sync with reliable failure recovery
+  try {
+    await recordInternalTransferCreatedInProjection(userId, sourceTx, destTx);
+  } catch (err: unknown) {
+    console.error('Failed to update projection on internal transfer creation:', err);
+    await markProjectionStale(
+      userId,
+      `TRANSFER_CREATE_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   return { sourceTransaction: sourceTx, destinationTransaction: destTx };
 }
@@ -750,10 +762,16 @@ export async function updateTransaction(
 
   const updatedTx: TransactionDocument = { ...current, ...updates };
 
-  // Non-blocking projection sync
-  recordTransactionUpdatedInProjection(userId, current, updatedTx).catch((err: unknown) => {
-    void err;
-  });
+  // Atomic projection sync with reliable failure recovery
+  try {
+    await recordTransactionUpdatedInProjection(userId, current, updatedTx);
+  } catch (err: unknown) {
+    console.error('Failed to update projection on transaction update:', err);
+    await markProjectionStale(
+      userId,
+      `UPDATE_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   await createAuditRecord({
     userId,
@@ -843,13 +861,15 @@ export async function voidTransaction(
       }
     });
 
-    // Non-blocking projection sync for voided transfer legs
-    for (const tDoc of transferDocs) {
-      if (tDoc.status !== 'VOIDED') {
-        recordTransactionVoidedInProjection(userId, tDoc).catch((err: unknown) => {
-          void err;
-        });
-      }
+    // Atomic projection sync for voided transfer legs
+    try {
+      await recordTransactionsVoidedInProjection(userId, transferDocs);
+    } catch (err: unknown) {
+      console.error('Failed to update projection on transfer voiding:', err);
+      await markProjectionStale(
+        userId,
+        `TRANSFER_VOID_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     await createAuditRecord({
@@ -903,10 +923,16 @@ export async function voidTransaction(
     updatedAt: now,
   };
 
-  // Non-blocking projection sync
-  recordTransactionVoidedInProjection(userId, current).catch((err: unknown) => {
-    void err;
-  });
+  // Atomic projection sync with reliable failure recovery
+  try {
+    await recordTransactionVoidedInProjection(userId, current);
+  } catch (err: unknown) {
+    console.error('Failed to update projection on transaction voiding:', err);
+    await markProjectionStale(
+      userId,
+      `VOID_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   await createAuditRecord({
     userId,

@@ -2,7 +2,7 @@ import { getFirebaseAdmin } from './firebase-admin.js';
 import { createAuditRecord } from './audit-service.js';
 import type { TransactionDocument } from './transaction-service.js';
 import { getTransactionBalanceDelta } from './reporting-semantics.js';
-import { recordTransactionCreatedInProjection } from './projection-service.js';
+import { recordTransactionCreatedInProjection, markProjectionStale } from './projection-service.js';
 
 export type AccountType = 'bank' | 'cash';
 
@@ -507,11 +507,17 @@ export async function reconcileAccount(
       adjustmentTransaction: adjustmentTx,
     };
   }).then(async (result) => {
-    // Audit after atomic transaction commit
+    // Audit and projection sync after atomic transaction commit
     if (result.adjustmentApplied && result.adjustmentTransaction) {
-      recordTransactionCreatedInProjection(userId, result.adjustmentTransaction).catch((err: unknown) => {
-        void err;
-      });
+      try {
+        await recordTransactionCreatedInProjection(userId, result.adjustmentTransaction);
+      } catch (err: unknown) {
+        console.error('Failed to update projection on reconciliation adjustment:', err);
+        await markProjectionStale(
+          userId,
+          `RECONCILIATION_ADJUSTMENT_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     if (result.adjustmentApplied) {
