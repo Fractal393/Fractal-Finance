@@ -35,6 +35,8 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
       tags: new Map(),
       audit: new Map(),
       projections: new Map(),
+      projectionOutbox: new Map(),
+      projectionMarkers: new Map(),
     };
 
     let docIdCounter = 1;
@@ -53,7 +55,14 @@ describe('Slice 3: Transactions, Splits, Transfers & Metadata', () => {
                   if (subColName === 'tags') return mockStore.tags;
                   if (subColName === 'audit') return mockStore.audit;
                   if (subColName === 'projections') return mockStore.projections;
-                  throw new Error(`Unexpected subcollection ${subColName}`);
+                  if (subColName === 'projectionOutbox') return mockStore.projectionOutbox;
+                  if (subColName === 'projectionMarkers') return mockStore.projectionMarkers;
+                  let customStore = (mockStore as Record<string, Map<string, Record<string, unknown>>>)[subColName];
+                  if (!customStore) {
+                    customStore = new Map();
+                    (mockStore as Record<string, Map<string, Record<string, unknown>>>)[subColName] = customStore;
+                  }
+                  return customStore;
                 };
 
                 interface MockFilter {

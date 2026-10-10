@@ -8,11 +8,8 @@ import {
 } from './reporting-semantics.js';
 import { AccountDocument } from './account-service.js';
 import {
-  recordTransactionCreatedInProjection,
-  recordTransactionVoidedInProjection,
-  recordTransactionUpdatedInProjection,
-  recordInternalTransferCreatedInProjection,
-  recordTransactionsVoidedInProjection,
+  createProjectionMutationEventRef,
+  applyProjectionMutationEvent,
   markProjectionStale,
 } from './projection-service.js';
 
@@ -47,6 +44,8 @@ export interface TransactionDocument {
   categoryIds?: string[];
   allocations: SplitAllocation[];
   idempotencyKey?: string | null;
+  version?: number;
+  lastEventId?: string | null;
   createdAt: string;
   updatedAt: string;
   voidedAt?: string | null;
@@ -286,6 +285,9 @@ export async function createTransaction(
     ),
   );
 
+  const txVersion = 1;
+  const eventId = `evt_${txId}_v1_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
   const newTx: TransactionDocument = {
     id: txId,
     userId,
@@ -303,11 +305,23 @@ export async function createTransaction(
     transferGroupId: null,
     allocations,
     idempotencyKey: input.idempotencyKey || null,
+    version: txVersion,
+    lastEventId: eventId,
     createdAt: now,
     updatedAt: now,
   };
 
   const accountRef = db.collection('users').doc(userId).collection('accounts').doc(input.accountId);
+
+  const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+    eventId,
+    createdAt: now,
+    userId,
+    eventType: 'TX_CREATED',
+    txId: newTx.id,
+    version: txVersion,
+    tx: newTx,
+  });
 
   await db.runTransaction(async (transaction) => {
     const accSnap = await transaction.get(accountRef);
@@ -322,6 +336,7 @@ export async function createTransaction(
       calculatedBalance: updatedCalculated,
       updatedAt: now,
     });
+    transaction.set(eventRef, eventDoc);
   });
 
   const isSplit = allocations.length > 0;
@@ -342,7 +357,7 @@ export async function createTransaction(
 
   // Atomic projection sync with reliable failure recovery
   try {
-    await recordTransactionCreatedInProjection(userId, newTx);
+    await applyProjectionMutationEvent(userId, eventDoc);
   } catch (err: unknown) {
     console.error('Failed to update projection on transaction creation:', err);
     await markProjectionStale(
@@ -419,6 +434,8 @@ export async function createInternalTransfer(
   const sourceDesc = input.description?.trim() || `Transfer to ${destAccount.name}`;
   const destDesc = input.description?.trim() || `Transfer from ${sourceAccount.name}`;
 
+  const eventId = `evt_xfer_${transferGroupId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+
   const sourceTx: TransactionDocument = {
     id: sourceRef.id,
     userId,
@@ -437,6 +454,8 @@ export async function createInternalTransfer(
     transferGroupId,
     allocations: [],
     idempotencyKey: input.idempotencyKey || null,
+    version: 1,
+    lastEventId: eventId,
     createdAt: now,
     updatedAt: now,
   };
@@ -458,13 +477,26 @@ export async function createInternalTransfer(
     status: 'POSTED',
     transferGroupId,
     allocations: [],
-    idempotencyKey: input.idempotencyKey ? `${input.idempotencyKey}_in` : null,
+    idempotencyKey: input.idempotencyKey ? `${input.idempotencyKey}_dest` : null,
+    version: 1,
+    lastEventId: eventId,
     createdAt: now,
     updatedAt: now,
   };
 
   const sourceAccRef = db.collection('users').doc(userId).collection('accounts').doc(input.sourceAccountId);
   const destAccRef = db.collection('users').doc(userId).collection('accounts').doc(input.destinationAccountId);
+
+  const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+    eventId,
+    createdAt: now,
+    userId,
+    eventType: 'TRANSFER_CREATED',
+    txId: transferGroupId,
+    version: 1,
+    sourceTx,
+    destTx,
+  });
 
   await db.runTransaction(async (transaction) => {
     const sSnap = await transaction.get(sourceAccRef);
@@ -489,6 +521,7 @@ export async function createInternalTransfer(
       calculatedBalance: (dData.calculatedBalance || 0) + input.amount,
       updatedAt: now,
     });
+    transaction.set(eventRef, eventDoc);
   });
 
   await createAuditRecord({
@@ -508,7 +541,7 @@ export async function createInternalTransfer(
 
   // Atomic paired projection sync with reliable failure recovery
   try {
-    await recordInternalTransferCreatedInProjection(userId, sourceTx, destTx);
+    await applyProjectionMutationEvent(userId, eventDoc);
   } catch (err: unknown) {
     console.error('Failed to update projection on internal transfer creation:', err);
     await markProjectionStale(
@@ -744,7 +777,24 @@ export async function updateTransaction(
   const newDelta = getTransactionBalanceDelta(newType, newAmount, 'POSTED', current.transferDirection);
   const balanceDifference = newDelta - oldDelta;
 
+  const nextVersion = (current.version || 1) + 1;
+  const eventId = `evt_${current.id}_v${nextVersion}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  updates.version = nextVersion;
+  updates.lastEventId = eventId;
+
+  const updatedTx: TransactionDocument = { ...current, ...updates };
   const accountRef = db.collection('users').doc(userId).collection('accounts').doc(current.accountId);
+
+  const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+    eventId,
+    createdAt: updates.updatedAt,
+    userId,
+    eventType: 'TX_UPDATED',
+    txId: current.id,
+    version: nextVersion,
+    oldTx: current,
+    newTx: updatedTx,
+  });
 
   await db.runTransaction(async (transaction) => {
     if (balanceDifference !== 0) {
@@ -758,13 +808,12 @@ export async function updateTransaction(
       }
     }
     transaction.update(txRef, updates);
+    transaction.set(eventRef, eventDoc);
   });
-
-  const updatedTx: TransactionDocument = { ...current, ...updates };
 
   // Atomic projection sync with reliable failure recovery
   try {
-    await recordTransactionUpdatedInProjection(userId, current, updatedTx);
+    await applyProjectionMutationEvent(userId, eventDoc);
   } catch (err: unknown) {
     console.error('Failed to update projection on transaction update:', err);
     await markProjectionStale(
@@ -833,6 +882,16 @@ export async function voidTransaction(
       .get();
 
     const transferDocs = pairSnap.docs.map((d) => d.data() as TransactionDocument);
+    const eventId = `evt_void_xfer_${current.transferGroupId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+      eventId,
+      createdAt: now,
+      userId,
+      eventType: 'TRANSFERS_VOIDED',
+      txId: current.transferGroupId,
+      version: (current.version || 1) + 1,
+      txList: transferDocs,
+    });
 
     await db.runTransaction(async (transaction) => {
       for (const tDoc of transferDocs) {
@@ -856,14 +915,17 @@ export async function voidTransaction(
             voidedAt: now,
             voidReason,
             updatedAt: now,
+            version: (tDoc.version || 1) + 1,
+            lastEventId: eventId,
           });
         }
       }
+      transaction.set(eventRef, eventDoc);
     });
 
     // Atomic projection sync for voided transfer legs
     try {
-      await recordTransactionsVoidedInProjection(userId, transferDocs);
+      await applyProjectionMutationEvent(userId, eventDoc);
     } catch (err: unknown) {
       console.error('Failed to update projection on transfer voiding:', err);
       await markProjectionStale(
@@ -897,6 +959,18 @@ export async function voidTransaction(
   const previousDelta = getTransactionBalanceDelta(current.type, current.amount, 'POSTED', current.transferDirection);
   const accountRef = db.collection('users').doc(userId).collection('accounts').doc(current.accountId);
 
+  const nextVersion = (current.version || 1) + 1;
+  const eventId = `evt_void_${current.id}_v${nextVersion}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+    eventId,
+    createdAt: now,
+    userId,
+    eventType: 'TX_VOIDED',
+    txId: current.id,
+    version: nextVersion,
+    tx: current,
+  });
+
   await db.runTransaction(async (transaction) => {
     const accSnap = await transaction.get(accountRef);
     if (accSnap.exists) {
@@ -912,7 +986,10 @@ export async function voidTransaction(
       voidedAt: now,
       voidReason,
       updatedAt: now,
+      version: nextVersion,
+      lastEventId: eventId,
     });
+    transaction.set(eventRef, eventDoc);
   });
 
   const voidedTx: TransactionDocument = {
@@ -921,11 +998,13 @@ export async function voidTransaction(
     voidedAt: now,
     voidReason,
     updatedAt: now,
+    version: nextVersion,
+    lastEventId: eventId,
   };
 
   // Atomic projection sync with reliable failure recovery
   try {
-    await recordTransactionVoidedInProjection(userId, current);
+    await applyProjectionMutationEvent(userId, eventDoc);
   } catch (err: unknown) {
     console.error('Failed to update projection on transaction voiding:', err);
     await markProjectionStale(

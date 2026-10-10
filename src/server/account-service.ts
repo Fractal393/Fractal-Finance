@@ -2,7 +2,12 @@ import { getFirebaseAdmin } from './firebase-admin.js';
 import { createAuditRecord } from './audit-service.js';
 import type { TransactionDocument } from './transaction-service.js';
 import { getTransactionBalanceDelta } from './reporting-semantics.js';
-import { recordTransactionCreatedInProjection, markProjectionStale } from './projection-service.js';
+import {
+  createProjectionMutationEventRef,
+  applyProjectionMutationEvent,
+  markProjectionStale,
+  ProjectionMutationEvent,
+} from './projection-service.js';
 
 export type AccountType = 'bank' | 'cash';
 
@@ -459,11 +464,13 @@ export async function reconcileAccount(
     };
 
     let adjustmentTx: TransactionDocument | null = null;
+    let adjustmentEventDoc: ProjectionMutationEvent | null = null;
     if (applyAdjustment && difference !== 0) {
       const txCol = db.collection('users').doc(userId).collection('transactions');
       const txRef = txCol.doc();
       const isPositive = difference > 0;
       const desc = input.notes?.trim() || `Reconciliation adjustment (${isPositive ? '+' : ''}${difference / 100})`;
+      const eventId = `evt_${txRef.id}_v1_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
 
       adjustmentTx = {
         id: txRef.id,
@@ -482,11 +489,25 @@ export async function reconcileAccount(
         status: 'POSTED',
         transferGroupId: null,
         allocations: [],
+        version: 1,
+        lastEventId: eventId,
         createdAt: now,
         updatedAt: now,
       };
 
+      const { eventRef, eventDoc } = createProjectionMutationEventRef(db, userId, {
+        eventId,
+        createdAt: now,
+        userId,
+        eventType: 'TX_CREATED',
+        txId: adjustmentTx.id,
+        version: 1,
+        tx: adjustmentTx,
+      });
+      adjustmentEventDoc = eventDoc;
+
       transaction.set(txRef, adjustmentTx);
+      transaction.set(eventRef, eventDoc);
       accountUpdates.calculatedBalance = currentCalculated + difference;
     }
 
@@ -505,12 +526,13 @@ export async function reconcileAccount(
       difference,
       adjustmentApplied: applyAdjustment && difference !== 0,
       adjustmentTransaction: adjustmentTx,
+      adjustmentEventDoc,
     };
   }).then(async (result) => {
     // Audit and projection sync after atomic transaction commit
-    if (result.adjustmentApplied && result.adjustmentTransaction) {
+    if (result.adjustmentApplied && result.adjustmentEventDoc) {
       try {
-        await recordTransactionCreatedInProjection(userId, result.adjustmentTransaction);
+        await applyProjectionMutationEvent(userId, result.adjustmentEventDoc);
       } catch (err: unknown) {
         console.error('Failed to update projection on reconciliation adjustment:', err);
         await markProjectionStale(

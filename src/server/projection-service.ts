@@ -4,6 +4,7 @@ import type { TransactionType } from './reporting-semantics.js';
 import type {
   Transaction as FirestoreTransaction,
   CollectionReference as FirestoreCollectionReference,
+  DocumentReference as FirestoreDocumentReference,
 } from 'firebase-admin/firestore';
 
 export interface MonthlySummaryProjection {
@@ -19,18 +20,25 @@ export interface MonthlySummaryProjection {
   reconciliationAdjustments: number;
 }
 
-export interface AppliedTxMeta {
+export interface ProjectionTxMarker {
+  txId: string;
+  version: number;
+  lastEventId: string;
   status: 'POSTED' | 'VOIDED' | 'DRAFT';
-  updatedAt: string;
-  type: string;
+  type: TransactionType;
   amount: number;
   transactionDate: string;
   reconciliationDiscrepancy?: number | null;
+  updatedAt: string;
 }
+
+// Backward-compatible alias
+export type AppliedTxMeta = ProjectionTxMarker;
 
 export interface DashboardProjection {
   userId: string;
   version: number;
+  generation: number;
   updatedAt: string;
   rebuiltAt?: string;
   isStale?: boolean;
@@ -55,7 +63,28 @@ export interface DashboardProjection {
     outstandingDebtLiability: number;
   };
   monthlySummaries: Record<string, MonthlySummaryProjection>;
-  appliedTxMeta: Record<string, AppliedTxMeta>;
+}
+
+export type ProjectionEventType =
+  | 'TX_CREATED'
+  | 'TRANSFER_CREATED'
+  | 'TX_UPDATED'
+  | 'TX_VOIDED'
+  | 'TRANSFERS_VOIDED';
+
+export interface ProjectionMutationEvent {
+  eventId: string;
+  userId: string;
+  eventType: ProjectionEventType;
+  createdAt: string;
+  txId: string;
+  version: number;
+  tx?: TransactionDocument;
+  oldTx?: TransactionDocument;
+  newTx?: TransactionDocument;
+  sourceTx?: TransactionDocument;
+  destTx?: TransactionDocument;
+  txList?: TransactionDocument[];
 }
 
 export interface ConsistencyVerificationResult {
@@ -69,6 +98,7 @@ export function createEmptyProjection(userId: string): DashboardProjection {
   return {
     userId,
     version: 1,
+    generation: 1,
     updatedAt: new Date().toISOString(),
     isStale: false,
     staleReason: null,
@@ -92,7 +122,6 @@ export function createEmptyProjection(userId: string): DashboardProjection {
       outstandingDebtLiability: 0,
     },
     monthlySummaries: {},
-    appliedTxMeta: {},
   };
 }
 
@@ -216,12 +245,14 @@ async function executeTransaction<T>(
     get: async (ref: { get: () => Promise<unknown> }) => ref.get(),
     set: (ref: { set: (d: unknown, o?: unknown) => Promise<unknown> | void }, data: unknown, options?: unknown) => ref.set(data, options),
     update: (ref: { update: (d: unknown) => Promise<unknown> | void }, data: unknown) => ref.update(data),
+    delete: (ref: { delete: () => Promise<unknown> | void }) => ref.delete(),
   };
   return updateFunction(simulated as unknown as FirestoreTransaction);
 }
 
 /**
  * Resolves the earliest POSTED transaction date from the canonical ledger using an indexed query.
+ * Executed safely outside transaction callbacks.
  */
 export async function resolveEarliestTransactionDate(
   userId: string,
@@ -243,7 +274,6 @@ export async function resolveEarliestTransactionDate(
     }
     return null;
   } catch {
-    // In mock testing environments where orderBy or limit might not be fully simulated:
     try {
       const allSnap = await col.where('status', '==', 'POSTED').get();
       if (!allSnap || allSnap.empty || !allSnap.docs.length) return null;
@@ -256,6 +286,90 @@ export async function resolveEarliestTransactionDate(
       return null;
     }
   }
+}
+
+/**
+ * Updates earliestTransactionDate in-memory inside the transaction snapshot safely.
+ */
+function updateEarliestDateSafely(
+  proj: DashboardProjection,
+  candidateEarliest: string | null,
+  newPostedDate: string | null,
+  oldDate?: string,
+): void {
+  if (proj.lifetime.totalPostedTransactions <= 0) {
+    proj.lifetime.earliestTransactionDate = null;
+    return;
+  }
+
+  let earliest = candidateEarliest;
+
+  if (newPostedDate) {
+    if (!earliest || newPostedDate < earliest) {
+      earliest = newPostedDate;
+    }
+  }
+
+  // Preserve valid existing date if it wasn't the transaction being altered
+  const current = proj.lifetime.earliestTransactionDate;
+  if (current && current !== oldDate) {
+    if (!earliest || current < earliest) {
+      earliest = current;
+    }
+  }
+
+  proj.lifetime.earliestTransactionDate = earliest;
+}
+
+/**
+ * Reverts a marker's previously posted state from projection data.
+ */
+function revertMarkerFromProjection(
+  proj: DashboardProjection,
+  marker: ProjectionTxMarker,
+): void {
+  if (marker.status !== 'POSTED') return;
+  const simulatedTx: TransactionDocument = {
+    id: marker.txId,
+    userId: proj.userId,
+    accountId: '',
+    type: marker.type,
+    amount: marker.amount,
+    transactionDate: marker.transactionDate,
+    status: 'POSTED',
+    reconciliationDiscrepancy: marker.reconciliationDiscrepancy,
+    categoryId: null,
+    counterpartyId: null,
+    transferGroupId: null,
+    allocations: [],
+    tags: [],
+    notes: '',
+    description: '',
+    createdAt: marker.updatedAt,
+    updatedAt: marker.updatedAt,
+  };
+  applyTransactionToProjectionData(proj, simulatedTx, -1);
+}
+
+/**
+ * Generates an outbox mutation event document reference and typed payload.
+ * Used by ledger mutation transactions to atomically commit outbox events with ledger changes.
+ */
+export function createProjectionMutationEventRef(
+  db: FirebaseFirestore.Firestore,
+  userId: string,
+  eventData: Omit<ProjectionMutationEvent, 'eventId' | 'createdAt'> & { eventId?: string; createdAt?: string },
+): { eventRef: FirestoreDocumentReference; eventDoc: ProjectionMutationEvent } {
+  const eventId =
+    eventData.eventId ||
+    `evt_${eventData.txId}_v${eventData.version}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const eventDoc: ProjectionMutationEvent = {
+    ...eventData,
+    eventId,
+    createdAt: eventData.createdAt || new Date().toISOString(),
+  };
+  const eventRef = db.collection('users').doc(userId).collection('projectionOutbox').doc(eventId);
+  return { eventRef: eventRef as unknown as FirestoreDocumentReference, eventDoc };
 }
 
 /**
@@ -282,309 +396,418 @@ export async function markProjectionStale(userId: string, reason: string): Promi
 }
 
 /**
+ * Applies a durable projection mutation event atomically to the dashboard projection
+ * and per-transaction marker, then deletes the outbox event upon completion.
+ * Fully idempotent against retries and duplicate events.
+ */
+export async function applyProjectionMutationEvent(
+  userId: string,
+  event: ProjectionMutationEvent,
+): Promise<void> {
+  const { db } = getFirebaseAdmin();
+  if (!db) return;
+
+  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
+  const txCol = db.collection('users').doc(userId).collection('transactions');
+
+  // Pre-resolve candidate earliest date OUTSIDE transaction callback if earliest may be affected
+  let candidateEarliest: string | null | undefined = undefined;
+  try {
+    const preSnap = await projRef.get();
+    const currentProj = preSnap.exists ? (preSnap.data() as DashboardProjection) : null;
+    const currentEarliest = currentProj?.lifetime?.earliestTransactionDate;
+
+    if (currentEarliest) {
+      if (
+        (event.eventType === 'TX_VOIDED' && event.tx && event.tx.transactionDate <= currentEarliest) ||
+        (event.eventType === 'TX_UPDATED' &&
+          event.oldTx &&
+          (event.oldTx.transactionDate <= currentEarliest || (event.newTx && event.newTx.transactionDate < currentEarliest))) ||
+        (event.eventType === 'TRANSFERS_VOIDED' &&
+          event.txList &&
+          event.txList.some((t) => t.transactionDate <= currentEarliest))
+      ) {
+        candidateEarliest = await resolveEarliestTransactionDate(userId, txCol);
+      }
+    }
+  } catch (err) {
+    console.warn(`Failed pre-resolving earliest date for event ${event.eventId}:`, err);
+  }
+
+  await executeTransaction(db, async (t) => {
+    const projSnap = await t.get(projRef);
+    const proj: DashboardProjection = projSnap && projSnap.exists
+      ? (projSnap.data() as DashboardProjection)
+      : createEmptyProjection(userId);
+
+    const outboxRef = db.collection('users').doc(userId).collection('projectionOutbox').doc(event.eventId);
+
+    switch (event.eventType) {
+      case 'TX_CREATED': {
+        const tx = event.tx;
+        if (!tx) break;
+
+        const markerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(tx.id);
+        const markerSnap = await t.get(markerRef);
+        const marker = markerSnap && markerSnap.exists ? (markerSnap.data() as ProjectionTxMarker) : null;
+
+        // Idempotency: exact event already applied or higher/equal version already posted
+        if (marker && (marker.lastEventId === event.eventId || (marker.status === tx.status && marker.version >= event.version))) {
+          if (typeof (t as unknown as { delete?: (r: unknown) => void }).delete === 'function') {
+            t.delete(outboxRef);
+          }
+          return;
+        }
+
+        if (marker && marker.status === 'POSTED') {
+          revertMarkerFromProjection(proj, marker);
+        }
+
+        if (tx.status === 'POSTED') {
+          applyTransactionToProjectionData(proj, tx, 1);
+        }
+
+        const newMarker: ProjectionTxMarker = {
+          txId: tx.id,
+          version: event.version,
+          lastEventId: event.eventId,
+          status: tx.status,
+          type: tx.type,
+          amount: tx.amount,
+          transactionDate: tx.transactionDate,
+          reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
+          updatedAt: tx.updatedAt || new Date().toISOString(),
+        };
+
+        t.set(markerRef, newMarker as unknown as Record<string, unknown>);
+        break;
+      }
+
+      case 'TRANSFER_CREATED': {
+        const { sourceTx, destTx } = event;
+        if (!sourceTx || !destTx) break;
+
+        const sMarkerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(sourceTx.id);
+        const dMarkerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(destTx.id);
+
+        const sSnap = await t.get(sMarkerRef);
+        const dSnap = await t.get(dMarkerRef);
+
+        const sMarker = sSnap && sSnap.exists ? (sSnap.data() as ProjectionTxMarker) : null;
+        const dMarker = dSnap && dSnap.exists ? (dSnap.data() as ProjectionTxMarker) : null;
+
+        const sApplied = sMarker && (sMarker.lastEventId === event.eventId || (sMarker.status === sourceTx.status && sMarker.version >= event.version));
+        const dApplied = dMarker && (dMarker.lastEventId === event.eventId || (dMarker.status === destTx.status && dMarker.version >= event.version));
+
+        if (sApplied && dApplied) {
+          if (typeof (t as unknown as { delete?: (r: unknown) => void }).delete === 'function') {
+            t.delete(outboxRef);
+          }
+          return;
+        }
+
+        if (sourceTx.status === 'POSTED' && !sApplied) {
+          if (sMarker && sMarker.status === 'POSTED') revertMarkerFromProjection(proj, sMarker);
+          applyTransactionToProjectionData(proj, sourceTx, 1);
+          t.set(sMarkerRef, {
+            txId: sourceTx.id,
+            version: event.version,
+            lastEventId: event.eventId,
+            status: sourceTx.status,
+            type: sourceTx.type,
+            amount: sourceTx.amount,
+            transactionDate: sourceTx.transactionDate,
+            reconciliationDiscrepancy: null,
+            updatedAt: sourceTx.updatedAt || new Date().toISOString(),
+          } as unknown as Record<string, unknown>);
+        }
+
+        if (destTx.status === 'POSTED' && !dApplied) {
+          if (dMarker && dMarker.status === 'POSTED') revertMarkerFromProjection(proj, dMarker);
+          applyTransactionToProjectionData(proj, destTx, 1);
+          t.set(dMarkerRef, {
+            txId: destTx.id,
+            version: event.version,
+            lastEventId: event.eventId,
+            status: destTx.status,
+            type: destTx.type,
+            amount: destTx.amount,
+            transactionDate: destTx.transactionDate,
+            reconciliationDiscrepancy: null,
+            updatedAt: destTx.updatedAt || new Date().toISOString(),
+          } as unknown as Record<string, unknown>);
+        }
+        break;
+      }
+
+      case 'TX_UPDATED': {
+        const { oldTx, newTx } = event;
+        if (!newTx) break;
+
+        const markerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(newTx.id);
+        const markerSnap = await t.get(markerRef);
+        const marker = markerSnap && markerSnap.exists ? (markerSnap.data() as ProjectionTxMarker) : null;
+
+        if (marker && (marker.lastEventId === event.eventId || marker.version >= event.version)) {
+          if (typeof (t as unknown as { delete?: (r: unknown) => void }).delete === 'function') {
+            t.delete(outboxRef);
+          }
+          return;
+        }
+
+        if (marker && marker.status === 'POSTED') {
+          revertMarkerFromProjection(proj, marker);
+        } else if (oldTx && oldTx.status === 'POSTED') {
+          applyTransactionToProjectionData(proj, oldTx, -1);
+        }
+
+        if (newTx.status === 'POSTED') {
+          applyTransactionToProjectionData(proj, newTx, 1);
+        }
+
+        if (candidateEarliest !== undefined) {
+          updateEarliestDateSafely(
+            proj,
+            candidateEarliest,
+            newTx.status === 'POSTED' ? newTx.transactionDate : null,
+            oldTx?.transactionDate,
+          );
+        }
+
+        const newMarker: ProjectionTxMarker = {
+          txId: newTx.id,
+          version: event.version,
+          lastEventId: event.eventId,
+          status: newTx.status,
+          type: newTx.type,
+          amount: newTx.amount,
+          transactionDate: newTx.transactionDate,
+          reconciliationDiscrepancy: newTx.reconciliationDiscrepancy ?? null,
+          updatedAt: newTx.updatedAt || new Date().toISOString(),
+        };
+
+        t.set(markerRef, newMarker as unknown as Record<string, unknown>);
+        break;
+      }
+
+      case 'TX_VOIDED': {
+        const tx = event.tx;
+        if (!tx) break;
+
+        const markerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(tx.id);
+        const markerSnap = await t.get(markerRef);
+        const marker = markerSnap && markerSnap.exists ? (markerSnap.data() as ProjectionTxMarker) : null;
+
+        if (marker && (marker.lastEventId === event.eventId || (marker.status === 'VOIDED' && marker.version >= event.version))) {
+          if (typeof (t as unknown as { delete?: (r: unknown) => void }).delete === 'function') {
+            t.delete(outboxRef);
+          }
+          return;
+        }
+
+        if (marker && marker.status === 'POSTED') {
+          revertMarkerFromProjection(proj, marker);
+        } else if (tx.status === 'POSTED') {
+          applyTransactionToProjectionData(proj, tx, -1);
+        }
+
+        if (candidateEarliest !== undefined) {
+          updateEarliestDateSafely(proj, candidateEarliest, null, tx.transactionDate);
+        }
+
+        const voidMarker: ProjectionTxMarker = {
+          txId: tx.id,
+          version: event.version,
+          lastEventId: event.eventId,
+          status: 'VOIDED',
+          type: tx.type,
+          amount: tx.amount,
+          transactionDate: tx.transactionDate,
+          reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
+          updatedAt: new Date().toISOString(),
+        };
+
+        t.set(markerRef, voidMarker as unknown as Record<string, unknown>);
+        break;
+      }
+
+      case 'TRANSFERS_VOIDED': {
+        const txList = event.txList || [];
+        for (const tx of txList) {
+          const markerRef = db.collection('users').doc(userId).collection('projectionMarkers').doc(tx.id);
+          const markerSnap = await t.get(markerRef);
+          const marker = markerSnap && markerSnap.exists ? (markerSnap.data() as ProjectionTxMarker) : null;
+
+          if (marker && (marker.lastEventId === event.eventId || (marker.status === 'VOIDED' && marker.version >= event.version))) {
+            continue;
+          }
+
+          if (marker && marker.status === 'POSTED') {
+            revertMarkerFromProjection(proj, marker);
+          } else if (tx.status === 'POSTED') {
+            applyTransactionToProjectionData(proj, tx, -1);
+          }
+
+          t.set(markerRef, {
+            txId: tx.id,
+            version: event.version,
+            lastEventId: event.eventId,
+            status: 'VOIDED',
+            type: tx.type,
+            amount: tx.amount,
+            transactionDate: tx.transactionDate,
+            reconciliationDiscrepancy: null,
+            updatedAt: new Date().toISOString(),
+          } as unknown as Record<string, unknown>);
+        }
+
+        if (candidateEarliest !== undefined) {
+          updateEarliestDateSafely(proj, candidateEarliest, null);
+        }
+        break;
+      }
+    }
+
+    proj.version = (proj.version || 1) + 1;
+    proj.updatedAt = new Date().toISOString();
+    proj.isStale = false;
+    proj.staleReason = null;
+
+    t.set(projRef, proj as unknown as Record<string, unknown>);
+    if (typeof (t as unknown as { delete?: (r: unknown) => void }).delete === 'function') {
+      t.delete(outboxRef);
+    }
+  });
+}
+
+/**
+ * Drains pending projection outbox events.
+ */
+export async function drainProjectionOutbox(
+  userId: string,
+  providedDocs?: FirebaseFirestore.QueryDocumentSnapshot[],
+): Promise<void> {
+  const { db } = getFirebaseAdmin();
+  if (!db) return;
+
+  const outboxCol = db.collection('users').doc(userId).collection('projectionOutbox');
+  let docs: FirebaseFirestore.DocumentSnapshot[];
+
+  if (providedDocs) {
+    docs = providedDocs;
+  } else {
+    try {
+      const snap = await outboxCol.orderBy('createdAt', 'asc').limit(50).get();
+      docs = snap.docs || [];
+    } catch {
+      const snap = await outboxCol.limit(50).get();
+      docs = snap.docs || [];
+    }
+  }
+
+  for (const doc of docs) {
+    const event = doc.data() as ProjectionMutationEvent;
+    if (!event) continue;
+    try {
+      await applyProjectionMutationEvent(userId, event);
+    } catch (err) {
+      console.error(`Failed to drain projection outbox event ${event.eventId}:`, err);
+      await markProjectionStale(
+        userId,
+        `OUTBOX_DRAIN_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      break;
+    }
+  }
+}
+
+/**
  * Updates the projection atomically when a transaction is created.
- * Idempotent: Repeated calls with identical transaction state are safe no-ops.
  */
 export async function recordTransactionCreatedInProjection(
   userId: string,
   tx: TransactionDocument,
 ): Promise<void> {
   if (tx.status !== 'POSTED') return;
-
-  const { db } = getFirebaseAdmin();
-  if (!db) return;
-
-  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
-
-  await executeTransaction(db, async (t) => {
-    const snap = await t.get(projRef);
-    let proj: DashboardProjection;
-    if (snap && snap.exists) {
-      proj = snap.data() as DashboardProjection;
-    } else {
-      proj = createEmptyProjection(userId);
-    }
-
-    if (!proj.appliedTxMeta) {
-      proj.appliedTxMeta = {};
-    }
-
-    const existingMeta = proj.appliedTxMeta[tx.id];
-    if (existingMeta && existingMeta.updatedAt === tx.updatedAt && existingMeta.status === tx.status) {
-      // Already applied identically; safe to retry
-      return;
-    }
-
-    if (existingMeta && existingMeta.status === 'POSTED') {
-      applyTransactionToProjectionData(
-        proj,
-        {
-          id: tx.id,
-          userId: tx.userId,
-          accountId: tx.accountId,
-          type: existingMeta.type as TransactionType,
-          amount: existingMeta.amount,
-          transactionDate: existingMeta.transactionDate,
-          status: 'POSTED',
-          reconciliationDiscrepancy: existingMeta.reconciliationDiscrepancy,
-        } as TransactionDocument,
-        -1,
-      );
-    }
-
-    applyTransactionToProjectionData(proj, tx, 1);
-
-    proj.appliedTxMeta[tx.id] = {
-      status: tx.status,
-      updatedAt: tx.updatedAt || new Date().toISOString(),
-      type: tx.type,
-      amount: tx.amount,
-      transactionDate: tx.transactionDate,
-      reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
-    };
-
-    proj.updatedAt = new Date().toISOString();
-    proj.isStale = false;
-    proj.staleReason = null;
-
-    t.set(projRef, proj as unknown as Record<string, unknown>);
-  });
+  const version = tx.version || 1;
+  const eventId = tx.lastEventId || `evt_${tx.id}_v${version}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const event: ProjectionMutationEvent = {
+    eventId,
+    userId,
+    eventType: 'TX_CREATED',
+    createdAt: tx.createdAt || new Date().toISOString(),
+    txId: tx.id,
+    version,
+    tx,
+  };
+  await applyProjectionMutationEvent(userId, event);
 }
 
 /**
  * Updates the projection atomically when an internal transfer is created.
- * Both legs (source and destination) are applied consistently together.
  */
 export async function recordInternalTransferCreatedInProjection(
   userId: string,
   sourceTx: TransactionDocument,
   destTx: TransactionDocument,
 ): Promise<void> {
-  const { db } = getFirebaseAdmin();
-  if (!db) return;
-
-  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
-
-  await executeTransaction(db, async (t) => {
-    const snap = await t.get(projRef);
-    let proj: DashboardProjection;
-    if (snap && snap.exists) {
-      proj = snap.data() as DashboardProjection;
-    } else {
-      proj = createEmptyProjection(userId);
-    }
-
-    if (!proj.appliedTxMeta) {
-      proj.appliedTxMeta = {};
-    }
-
-    const sMeta = proj.appliedTxMeta[sourceTx.id];
-    const dMeta = proj.appliedTxMeta[destTx.id];
-
-    const sourceAlreadyApplied = sMeta && sMeta.updatedAt === sourceTx.updatedAt && sMeta.status === sourceTx.status;
-    const destAlreadyApplied = dMeta && dMeta.updatedAt === destTx.updatedAt && dMeta.status === destTx.status;
-
-    if (sourceAlreadyApplied && destAlreadyApplied) {
-      return; // Already applied both legs
-    }
-
-    if (sourceTx.status === 'POSTED' && !sourceAlreadyApplied) {
-      applyTransactionToProjectionData(proj, sourceTx, 1);
-      proj.appliedTxMeta[sourceTx.id] = {
-        status: sourceTx.status,
-        updatedAt: sourceTx.updatedAt || new Date().toISOString(),
-        type: sourceTx.type,
-        amount: sourceTx.amount,
-        transactionDate: sourceTx.transactionDate,
-        reconciliationDiscrepancy: null,
-      };
-    }
-
-    if (destTx.status === 'POSTED' && !destAlreadyApplied) {
-      applyTransactionToProjectionData(proj, destTx, 1);
-      proj.appliedTxMeta[destTx.id] = {
-        status: destTx.status,
-        updatedAt: destTx.updatedAt || new Date().toISOString(),
-        type: destTx.type,
-        amount: destTx.amount,
-        transactionDate: destTx.transactionDate,
-        reconciliationDiscrepancy: null,
-      };
-    }
-
-    proj.updatedAt = new Date().toISOString();
-    proj.isStale = false;
-    proj.staleReason = null;
-
-    t.set(projRef, proj as unknown as Record<string, unknown>);
-  });
+  const transferGroupId = sourceTx.transferGroupId || `xfer_${sourceTx.id}_${destTx.id}`;
+  const eventId = `evt_xfer_${transferGroupId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const event: ProjectionMutationEvent = {
+    eventId,
+    userId,
+    eventType: 'TRANSFER_CREATED',
+    createdAt: sourceTx.createdAt || new Date().toISOString(),
+    txId: transferGroupId,
+    version: 1,
+    sourceTx,
+    destTx,
+  };
+  await applyProjectionMutationEvent(userId, event);
 }
 
 /**
  * Updates the projection atomically when a transaction is edited.
- * Handles date changes, amount changes, and type changes.
- * Accurately updates earliestTransactionDate if the earliest transaction is altered.
  */
 export async function recordTransactionUpdatedInProjection(
   userId: string,
   oldTx: TransactionDocument,
   newTx: TransactionDocument,
 ): Promise<void> {
-  const { db } = getFirebaseAdmin();
-  if (!db) return;
-
-  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
-  const txCol = db.collection('users').doc(userId).collection('transactions');
-
-  await executeTransaction(db, async (t) => {
-    const snap = await t.get(projRef);
-    let proj: DashboardProjection;
-    if (snap && snap.exists) {
-      proj = snap.data() as DashboardProjection;
-    } else {
-      proj = createEmptyProjection(userId);
-    }
-
-    if (!proj.appliedTxMeta) {
-      proj.appliedTxMeta = {};
-    }
-
-    const existingMeta = proj.appliedTxMeta[newTx.id];
-    if (existingMeta && existingMeta.updatedAt === newTx.updatedAt && existingMeta.status === newTx.status) {
-      return; // Already applied this update
-    }
-
-    const stateToRevert = existingMeta && existingMeta.status === 'POSTED'
-      ? {
-          type: existingMeta.type,
-          amount: existingMeta.amount,
-          transactionDate: existingMeta.transactionDate,
-          reconciliationDiscrepancy: existingMeta.reconciliationDiscrepancy,
-        }
-      : (oldTx.status === 'POSTED' ? oldTx : null);
-
-    if (stateToRevert) {
-      applyTransactionToProjectionData(
-        proj,
-        {
-          id: oldTx.id,
-          userId: oldTx.userId,
-          accountId: oldTx.accountId,
-          type: stateToRevert.type as TransactionType,
-          amount: stateToRevert.amount,
-          transactionDate: stateToRevert.transactionDate,
-          status: 'POSTED',
-          reconciliationDiscrepancy: stateToRevert.reconciliationDiscrepancy,
-        } as TransactionDocument,
-        -1,
-      );
-    }
-
-    if (newTx.status === 'POSTED') {
-      applyTransactionToProjectionData(proj, newTx, 1);
-    }
-
-    proj.appliedTxMeta[newTx.id] = {
-      status: newTx.status,
-      updatedAt: newTx.updatedAt || new Date().toISOString(),
-      type: newTx.type,
-      amount: newTx.amount,
-      transactionDate: newTx.transactionDate,
-      reconciliationDiscrepancy: newTx.reconciliationDiscrepancy ?? null,
-    };
-
-    // If earliest transaction was modified (date moved forward or voided), recalculate earliest
-    const earliest = proj.lifetime.earliestTransactionDate;
-    if (earliest && (oldTx.transactionDate <= earliest || newTx.transactionDate < earliest)) {
-      proj.lifetime.earliestTransactionDate = await resolveEarliestTransactionDate(userId, txCol);
-    }
-
-    proj.updatedAt = new Date().toISOString();
-    proj.isStale = false;
-    proj.staleReason = null;
-
-    t.set(projRef, proj as unknown as Record<string, unknown>);
-  });
+  const version = newTx.version || (oldTx.version || 1) + 1;
+  const eventId = newTx.lastEventId || `evt_${newTx.id}_v${version}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const event: ProjectionMutationEvent = {
+    eventId,
+    userId,
+    eventType: 'TX_UPDATED',
+    createdAt: newTx.updatedAt || new Date().toISOString(),
+    txId: newTx.id,
+    version,
+    oldTx,
+    newTx,
+  };
+  await applyProjectionMutationEvent(userId, event);
 }
 
 /**
  * Updates the projection atomically when a single transaction is voided.
- * Updates earliestTransactionDate if the voided transaction had the earliest date.
  */
 export async function recordTransactionVoidedInProjection(
   userId: string,
   tx: TransactionDocument,
 ): Promise<void> {
-  const { db } = getFirebaseAdmin();
-  if (!db) return;
-
-  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
-  const txCol = db.collection('users').doc(userId).collection('transactions');
-
-  await executeTransaction(db, async (t) => {
-    const snap = await t.get(projRef);
-    let proj: DashboardProjection;
-    if (snap && snap.exists) {
-      proj = snap.data() as DashboardProjection;
-    } else {
-      proj = createEmptyProjection(userId);
-    }
-
-    if (!proj.appliedTxMeta) {
-      proj.appliedTxMeta = {};
-    }
-
-    const existingMeta = proj.appliedTxMeta[tx.id];
-    if (existingMeta && existingMeta.status === 'VOIDED') {
-      return; // Already voided
-    }
-
-    const stateToRevert = existingMeta && existingMeta.status === 'POSTED'
-      ? {
-          type: existingMeta.type,
-          amount: existingMeta.amount,
-          transactionDate: existingMeta.transactionDate,
-          reconciliationDiscrepancy: existingMeta.reconciliationDiscrepancy,
-        }
-      : (tx.status === 'POSTED' ? tx : null);
-
-    if (stateToRevert) {
-      applyTransactionToProjectionData(
-        proj,
-        {
-          id: tx.id,
-          userId: tx.userId,
-          accountId: tx.accountId,
-          type: stateToRevert.type as TransactionType,
-          amount: stateToRevert.amount,
-          transactionDate: stateToRevert.transactionDate,
-          status: 'POSTED',
-          reconciliationDiscrepancy: stateToRevert.reconciliationDiscrepancy,
-        } as TransactionDocument,
-        -1,
-      );
-    }
-
-    proj.appliedTxMeta[tx.id] = {
-      status: 'VOIDED',
-      updatedAt: tx.updatedAt || new Date().toISOString(),
-      type: tx.type,
-      amount: tx.amount,
-      transactionDate: tx.transactionDate,
-      reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
-    };
-
-    const earliest = proj.lifetime.earliestTransactionDate;
-    if (earliest && tx.transactionDate <= earliest) {
-      proj.lifetime.earliestTransactionDate = await resolveEarliestTransactionDate(userId, txCol);
-    }
-
-    proj.updatedAt = new Date().toISOString();
-    proj.isStale = false;
-    proj.staleReason = null;
-
-    t.set(projRef, proj as unknown as Record<string, unknown>);
-  });
+  const version = (tx.version || 1) + 1;
+  const eventId = tx.lastEventId || `evt_void_${tx.id}_v${version}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const event: ProjectionMutationEvent = {
+    eventId,
+    userId,
+    eventType: 'TX_VOIDED',
+    createdAt: new Date().toISOString(),
+    txId: tx.id,
+    version,
+    tx,
+  };
+  await applyProjectionMutationEvent(userId, event);
 }
 
 /**
@@ -594,89 +817,24 @@ export async function recordTransactionsVoidedInProjection(
   userId: string,
   txList: TransactionDocument[],
 ): Promise<void> {
-  const { db } = getFirebaseAdmin();
-  if (!db) return;
-
-  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
-  const txCol = db.collection('users').doc(userId).collection('transactions');
-
-  await executeTransaction(db, async (t) => {
-    const snap = await t.get(projRef);
-    let proj: DashboardProjection;
-    if (snap && snap.exists) {
-      proj = snap.data() as DashboardProjection;
-    } else {
-      proj = createEmptyProjection(userId);
-    }
-
-    if (!proj.appliedTxMeta) {
-      proj.appliedTxMeta = {};
-    }
-
-    let needsEarliestResolution = false;
-    const earliest = proj.lifetime.earliestTransactionDate;
-
-    for (const tx of txList) {
-      const existingMeta = proj.appliedTxMeta[tx.id];
-      if (existingMeta && existingMeta.status === 'VOIDED') {
-        continue;
-      }
-
-      const stateToRevert = existingMeta && existingMeta.status === 'POSTED'
-        ? {
-            type: existingMeta.type,
-            amount: existingMeta.amount,
-            transactionDate: existingMeta.transactionDate,
-            reconciliationDiscrepancy: existingMeta.reconciliationDiscrepancy,
-          }
-        : (tx.status === 'POSTED' ? tx : null);
-
-      if (stateToRevert) {
-        applyTransactionToProjectionData(
-          proj,
-          {
-            id: tx.id,
-            userId: tx.userId,
-            accountId: tx.accountId,
-            type: stateToRevert.type as TransactionType,
-            amount: stateToRevert.amount,
-            transactionDate: stateToRevert.transactionDate,
-            status: 'POSTED',
-            reconciliationDiscrepancy: stateToRevert.reconciliationDiscrepancy,
-          } as TransactionDocument,
-          -1,
-        );
-      }
-
-      proj.appliedTxMeta[tx.id] = {
-        status: 'VOIDED',
-        updatedAt: tx.updatedAt || new Date().toISOString(),
-        type: tx.type,
-        amount: tx.amount,
-        transactionDate: tx.transactionDate,
-        reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
-      };
-
-      if (earliest && tx.transactionDate <= earliest) {
-        needsEarliestResolution = true;
-      }
-    }
-
-    if (needsEarliestResolution) {
-      proj.lifetime.earliestTransactionDate = await resolveEarliestTransactionDate(userId, txCol);
-    }
-
-    proj.updatedAt = new Date().toISOString();
-    proj.isStale = false;
-    proj.staleReason = null;
-
-    t.set(projRef, proj as unknown as Record<string, unknown>);
-  });
+  const txId = txList[0]?.transferGroupId || txList[0]?.id || 'multi_void';
+  const eventId = `evt_void_list_${txId}_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const event: ProjectionMutationEvent = {
+    eventId,
+    userId,
+    eventType: 'TRANSFERS_VOIDED',
+    createdAt: new Date().toISOString(),
+    txId,
+    version: 1,
+    txList,
+  };
+  await applyProjectionMutationEvent(userId, event);
 }
 
 /**
  * Rebuilds the user's dashboard projection completely from the canonical transaction ledger.
- * Guarded against concurrent ledger writes during the rebuild window.
+ * Guarded by optimistic generation & timestamp fencing.
+ * No unconditional direct-write fallback: aborts safely if concurrent mutations continuously conflict.
  */
 export async function rebuildProjectionFromLedger(userId: string): Promise<DashboardProjection> {
   const { db } = getFirebaseAdmin();
@@ -684,91 +842,122 @@ export async function rebuildProjectionFromLedger(userId: string): Promise<Dashb
 
   const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
   const txCol = db.collection('users').doc(userId).collection('transactions');
+  const outboxCol = db.collection('users').doc(userId).collection('projectionOutbox');
 
+  const MAX_RETRY_ATTEMPTS = 5;
   let attempts = 0;
-  while (attempts < 5) {
+
+  while (attempts < MAX_RETRY_ATTEMPTS) {
     attempts++;
     const rebuildStartTime = new Date().toISOString();
+
+    // Read current projection generation fencing token before reading ledger
+    const preSnap = await projRef.get();
+    const preData = preSnap.exists ? (preSnap.data() as DashboardProjection) : null;
+    const expectedGeneration = preData?.generation ?? 0;
+
+    // Read canonical ledger
     const snap = await txCol.where('status', '==', 'POSTED').get();
-
-    const proj = createEmptyProjection(userId);
     const txDocs = (snap.docs || []).map((d) => d.data() as TransactionDocument);
-
     txDocs.sort((a, b) => a.transactionDate.localeCompare(b.transactionDate));
 
+    const proj = createEmptyProjection(userId);
     for (const tx of txDocs) {
       applyTransactionToProjectionData(proj, tx, 1);
-      proj.appliedTxMeta[tx.id] = {
-        status: tx.status,
-        updatedAt: tx.updatedAt || new Date().toISOString(),
-        type: tx.type,
-        amount: tx.amount,
-        transactionDate: tx.transactionDate,
-        reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
-      };
     }
 
+    proj.generation = expectedGeneration + 1;
     proj.rebuiltAt = rebuildStartTime;
     proj.updatedAt = new Date().toISOString();
     proj.isStale = false;
     proj.staleReason = null;
 
     let conflict = false;
-    await executeTransaction(db, async (t) => {
-      const currentSnap = await t.get(projRef);
-      if (currentSnap && currentSnap.exists) {
-        const currentData = currentSnap.data() as DashboardProjection;
-        // If an update occurred after we started reading the ledger, this rebuild snapshot is stale
-        if (currentData.updatedAt && currentData.updatedAt > rebuildStartTime) {
-          conflict = true;
-          return;
+    try {
+      await executeTransaction(db, async (t) => {
+        const currentSnap = await t.get(projRef);
+        if (currentSnap && currentSnap.exists) {
+          const currentData = currentSnap.data() as DashboardProjection;
+          // Fencing: If an update occurred after we started reading the ledger, or if generation changed:
+          if (
+            (currentData.updatedAt && currentData.updatedAt > rebuildStartTime) ||
+            (currentData.generation !== undefined && currentData.generation !== expectedGeneration)
+          ) {
+            conflict = true;
+            return;
+          }
         }
-      }
-      t.set(projRef, proj as unknown as Record<string, unknown>);
-    });
+        t.set(projRef, proj as unknown as Record<string, unknown>);
+      });
+    } catch {
+      conflict = true;
+    }
 
     if (!conflict) {
+      // Rebuild succeeded under fencing!
+      // Clean up any outbox events created before rebuild started
+      try {
+        const pendingOutbox = await outboxCol.get();
+        if (pendingOutbox && !pendingOutbox.empty && pendingOutbox.docs) {
+          for (const d of pendingOutbox.docs) {
+            const evt = d.data() as ProjectionMutationEvent;
+            if (evt && evt.createdAt <= rebuildStartTime) {
+              await d.ref.delete();
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`Failed cleaning outbox after rebuild for user ${userId}:`, err);
+      }
+
       return proj;
+    }
+
+    // Exponential backoff before next attempt
+    if (attempts < MAX_RETRY_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, attempts * 50));
     }
   }
 
-  // Fallback: final direct write if retries exhausted
-  const finalSnap = await txCol.where('status', '==', 'POSTED').get();
-  const proj = createEmptyProjection(userId);
-  const txDocs = (finalSnap.docs || []).map((d) => d.data() as TransactionDocument);
-  txDocs.sort((a, b) => a.transactionDate.localeCompare(b.transactionDate));
-
-  for (const tx of txDocs) {
-    applyTransactionToProjectionData(proj, tx, 1);
-    proj.appliedTxMeta[tx.id] = {
-      status: tx.status,
-      updatedAt: tx.updatedAt || new Date().toISOString(),
-      type: tx.type,
-      amount: tx.amount,
-      transactionDate: tx.transactionDate,
-      reconciliationDiscrepancy: tx.reconciliationDiscrepancy ?? null,
-    };
-  }
-
-  proj.rebuiltAt = new Date().toISOString();
-  proj.updatedAt = new Date().toISOString();
-  proj.isStale = false;
-  proj.staleReason = null;
-
-  await projRef.set(proj as unknown as Record<string, unknown>);
-  return proj;
+  // Fencing check: NO direct write fallback!
+  // If retries are exhausted due to continuous concurrent mutations, mark stale and throw error
+  await markProjectionStale(
+    userId,
+    'REBUILD_CONFLICT: Continuous concurrent ledger mutations prevented atomic rebuild fencing',
+  );
+  throw new Error(
+    `Projection rebuild aborted after ${MAX_RETRY_ATTEMPTS} attempts due to concurrent ledger mutations. Fencing prevented overwriting newer projection state.`,
+  );
 }
 
 /**
- * Retrieves the stored projection document. If not yet initialized or marked stale,
- * repairs it by rebuilding from the canonical transaction ledger.
+ * Retrieves the stored projection document. If not yet initialized, has pending outbox events,
+ * or is marked stale, repairs it by draining outbox or rebuilding from the canonical transaction ledger.
  */
 export async function getOrBuildProjection(userId: string): Promise<DashboardProjection> {
   const { db } = getFirebaseAdmin();
   if (!db) throw new Error('Firestore not initialized');
 
+  const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
+  const outboxCol = db.collection('users').doc(userId).collection('projectionOutbox');
+
+  // Check for any pending unapplied mutation events (e.g. process was killed after ledger write)
   try {
-    const projRef = db.collection('users').doc(userId).collection('projections').doc('dashboard');
+    let pendingSnap = null;
+    if (typeof outboxCol.limit === 'function') {
+      pendingSnap = await outboxCol.limit(50).get();
+    } else if (typeof outboxCol.get === 'function') {
+      pendingSnap = await outboxCol.get();
+    }
+    if (pendingSnap && !pendingSnap.empty && pendingSnap.docs && pendingSnap.docs.length > 0) {
+      await drainProjectionOutbox(userId, pendingSnap.docs as FirebaseFirestore.QueryDocumentSnapshot[]);
+    }
+  } catch (err) {
+    console.warn(`Failed checking projection outbox for user ${userId}:`, err);
+  }
+
+  // Load projection doc
+  try {
     const snap = await projRef.get();
     if (snap && snap.exists) {
       const proj = snap.data() as DashboardProjection;

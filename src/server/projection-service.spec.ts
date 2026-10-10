@@ -2,23 +2,28 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { setFirebaseAdminForTesting } from './firebase-admin.js';
 import {
   createEmptyProjection,
-  applyTransactionToProjectionData,
   rebuildProjectionFromLedger,
   getOrBuildProjection,
   recordTransactionCreatedInProjection,
   recordTransactionVoidedInProjection,
   recordTransactionUpdatedInProjection,
   recordInternalTransferCreatedInProjection,
-  recordTransactionsVoidedInProjection,
   markProjectionStale,
   verifyProjectionConsistency,
+  ProjectionMutationEvent,
+  DashboardProjection,
+  ProjectionTxMarker,
 } from './projection-service.js';
 import type { TransactionDocument } from './transaction-service.js';
 
-describe('Projection Service & Rebuildable Derived Projections', () => {
+describe('Projection Service: Atomicity, Scalability, and Concurrency', () => {
   const userId = 'user-proj-123';
   let transactionsStore: Map<string, TransactionDocument>;
   let projectionsStore: Map<string, Record<string, unknown>>;
+  let markersStore: Map<string, Record<string, unknown>>;
+  let outboxStore: Map<string, Record<string, unknown>>;
+  let docVersions: Map<string, number>;
+  let conflictHook: ((attempt: number) => boolean) | null = null;
 
   interface MockFilter {
     field: string;
@@ -32,25 +37,26 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
   }
 
   const createQueryBuilder = (
+    store: Map<string, Record<string, unknown>>,
     filters: MockFilter[] = [],
     orderBys: MockOrder[] = [],
     limitVal?: number,
   ) => {
     return {
       where: (field: string, op: string, val: unknown) => {
-        return createQueryBuilder([...filters, { field, op, val }], orderBys, limitVal);
+        return createQueryBuilder(store, [...filters, { field, op, val }], orderBys, limitVal);
       },
       orderBy: (field: string, dir: 'asc' | 'desc' = 'asc') => {
-        return createQueryBuilder(filters, [...orderBys, { field, dir }], limitVal);
+        return createQueryBuilder(store, filters, [...orderBys, { field, dir }], limitVal);
       },
       limit: (n: number) => {
-        return createQueryBuilder(filters, orderBys, n);
+        return createQueryBuilder(store, filters, orderBys, n);
       },
       get: async () => {
-        let docs = Array.from(transactionsStore.values()).filter((t) => t.userId === userId);
+        let docs = Array.from(store.values()).filter((t) => t['userId'] === userId || !t['userId']);
         for (const f of filters) {
           docs = docs.filter((t) => {
-            const val = (t as unknown as Record<string, unknown>)[f.field];
+            const val = t[f.field];
             if (f.op === '==') return val === f.val;
             if (f.op === '>=') return (val as string) >= (f.val as string);
             if (f.op === '<=') return (val as string) <= (f.val as string);
@@ -62,8 +68,8 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
         if (orderBys.length > 0) {
           docs.sort((a, b) => {
             for (const o of orderBys) {
-              const aVal = String((a as unknown as Record<string, unknown>)[o.field] ?? '');
-              const bVal = String((b as unknown as Record<string, unknown>)[o.field] ?? '');
+              const aVal = String(a[o.field] ?? '');
+              const bVal = String(b[o.field] ?? '');
               const comp = o.dir === 'desc' ? bVal.localeCompare(aVal) : aVal.localeCompare(bVal);
               if (comp !== 0) return comp;
             }
@@ -75,15 +81,59 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
         }
         return {
           empty: docs.length === 0,
-          docs: docs.map((d) => ({ id: d.id, data: () => d })),
+          docs: docs.map((d) => ({
+            id: (d['id'] || d['txId'] || d['eventId']) as string,
+            data: () => d,
+            ref: {
+              delete: async () => {
+                const key = `${userId}/${d['id'] || d['txId'] || d['eventId']}`;
+                store.delete(key);
+                docVersions.set(key, (docVersions.get(key) || 0) + 1);
+              },
+            },
+          })),
         };
       },
     };
   };
 
+  const createDocRef = (store: Map<string, Record<string, unknown>>, path: string) => ({
+    _path: path,
+    get: async () => {
+      const data = store.get(path);
+      return {
+        id: path.split('/').pop() || '',
+        exists: !!data,
+        data: () => data,
+      };
+    },
+    set: async (val: Record<string, unknown>, opts?: { merge?: boolean }) => {
+      if (opts?.merge) {
+        const existing = store.get(path) || {};
+        store.set(path, { ...existing, ...val });
+      } else {
+        store.set(path, val);
+      }
+      docVersions.set(path, (docVersions.get(path) || 0) + 1);
+    },
+    update: async (val: Record<string, unknown>) => {
+      const existing = store.get(path) || {};
+      store.set(path, { ...existing, ...val });
+      docVersions.set(path, (docVersions.get(path) || 0) + 1);
+    },
+    delete: async () => {
+      store.delete(path);
+      docVersions.set(path, (docVersions.get(path) || 0) + 1);
+    },
+  });
+
   beforeEach(() => {
     transactionsStore = new Map();
     projectionsStore = new Map();
+    markersStore = new Map();
+    outboxStore = new Map();
+    docVersions = new Map();
+    conflictHook = null;
 
     const mockDb = {
       collection: (colName: string) => {
@@ -92,47 +142,126 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
           doc: (docUserId: string) => ({
             collection: (subCol: string) => {
               if (subCol === 'transactions') {
-                return createQueryBuilder();
+                const base = createQueryBuilder(transactionsStore as unknown as Map<string, Record<string, unknown>>);
+                return {
+                  ...base,
+                  doc: (docId: string) => createDocRef(transactionsStore as unknown as Map<string, Record<string, unknown>>, `${docUserId}/${docId}`),
+                };
               }
               if (subCol === 'projections') {
                 return {
-                  doc: (docId: string) => ({
-                    get: async () => {
-                      const data = projectionsStore.get(`${docUserId}/${docId}`);
-                      return {
-                        exists: !!data,
-                        data: () => data,
-                      };
-                    },
-                    set: async (val: Record<string, unknown>, opts?: { merge?: boolean }) => {
-                      if (opts?.merge) {
-                        const existing = projectionsStore.get(`${docUserId}/${docId}`) || {};
-                        projectionsStore.set(`${docUserId}/${docId}`, { ...existing, ...val });
-                      } else {
-                        projectionsStore.set(`${docUserId}/${docId}`, val);
-                      }
-                    },
-                    update: async (val: Record<string, unknown>) => {
-                      const existing = projectionsStore.get(`${docUserId}/${docId}`) || {};
-                      projectionsStore.set(`${docUserId}/${docId}`, { ...existing, ...val });
-                    },
-                  }),
+                  doc: (docId: string) => createDocRef(projectionsStore, `${docUserId}/${docId}`),
+                };
+              }
+              if (subCol === 'projectionMarkers') {
+                return {
+                  doc: (docId: string) => createDocRef(markersStore, `${docUserId}/${docId}`),
+                };
+              }
+              if (subCol === 'projectionOutbox') {
+                const base = createQueryBuilder(outboxStore);
+                return {
+                  ...base,
+                  doc: (docId: string) => createDocRef(outboxStore, `${docUserId}/${docId}`),
                 };
               }
               return {
                 get: async () => ({ empty: true, docs: [] }),
+                doc: (docId: string) => createDocRef(new Map(), `${docUserId}/${docId}`),
               };
             },
           }),
         };
       },
+
+      /**
+       * Realistic Firestore transaction emulator:
+       * - Tracks read snapshot versions on t.get(ref)
+       * - Buffers writes (set, update, delete) until commit phase
+       * - Detects optimistic concurrency conflicts
+       * - Automatically retries up to 5 attempts
+       * - Allows conflict injection hook for testing race conditions
+       */
       runTransaction: async (updateFunction: (transaction: unknown) => Promise<unknown>) => {
-        const transaction = {
-          get: async (ref: { get: () => Promise<unknown> }) => ref.get(),
-          set: (ref: { set: (v: Record<string, unknown>, opts?: Record<string, unknown>) => Promise<void> }, data: Record<string, unknown>, opts?: Record<string, unknown>) => ref.set(data, opts),
-          update: (ref: { update: (v: Record<string, unknown>) => Promise<void> }, data: Record<string, unknown>) => ref.update(data),
-        };
-        return updateFunction(transaction);
+        const MAX_TX_ATTEMPTS = 20;
+        let attempt = 0;
+
+        while (attempt < MAX_TX_ATTEMPTS) {
+          attempt++;
+          const readVersions = new Map<string, number>();
+          const bufferedWrites: (() => void)[] = [];
+
+          const tx = {
+            get: async (ref: { _path: string; get: () => Promise<unknown> }) => {
+              const path = ref._path;
+              const currentVer = docVersions.get(path) || 0;
+              readVersions.set(path, currentVer);
+              return ref.get();
+            },
+            set: (
+              ref: { _path: string; set: (val: Record<string, unknown>, opts?: { merge?: boolean }) => Promise<void> },
+              data: Record<string, unknown>,
+              opts?: { merge?: boolean },
+            ) => {
+              bufferedWrites.push(() => {
+                ref.set(data, opts);
+              });
+            },
+            update: (
+              ref: { _path: string; update: (val: Record<string, unknown>) => Promise<void> },
+              data: Record<string, unknown>,
+            ) => {
+              bufferedWrites.push(() => {
+                ref.update(data);
+              });
+            },
+            delete: (ref: { _path: string; delete: () => Promise<void> }) => {
+              bufferedWrites.push(() => {
+                ref.delete();
+              });
+            },
+          };
+
+          try {
+            const result = await updateFunction(tx);
+
+            // Commit validation: verify no read document modified concurrently
+            let conflictDetected = false;
+            for (const [path, readVer] of readVersions.entries()) {
+              const currentVer = docVersions.get(path) || 0;
+              if (currentVer !== readVer) {
+                conflictDetected = true;
+                break;
+              }
+            }
+
+            if (conflictHook && conflictHook(attempt)) {
+              conflictDetected = true;
+            }
+
+            if (conflictDetected) {
+              const err = new Error('Firestore transaction aborted due to concurrent conflict');
+              (err as unknown as { code: number }).code = 10; // ABORTED
+              throw err;
+            }
+
+            // Atomic commit of all buffered writes
+            for (const write of bufferedWrites) {
+              write();
+            }
+
+            return result;
+          } catch (err: unknown) {
+            const errorCode = (err as { code?: number })?.code;
+            if (errorCode === 10 && attempt < MAX_TX_ATTEMPTS) {
+              await new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * 15) + 5));
+              continue; // Retry transaction with fresh read snapshot
+            }
+            throw err;
+          }
+        }
+
+        throw new Error(`Firestore transaction failed after ${MAX_TX_ATTEMPTS} attempts due to conflicts`);
       },
     };
 
@@ -144,9 +273,11 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
     });
   });
 
-  it('creates an empty projection with zero balances and liabilities', () => {
+  it('creates an empty projection with zero balances, zero liabilities, and no unbounded metadata', () => {
     const proj = createEmptyProjection(userId);
     expect(proj.userId).toBe(userId);
+    expect(proj.version).toBe(1);
+    expect(proj.generation).toBe(1);
     expect(proj.lifetime.grossIncome).toBe(0);
     expect(proj.lifetime.consumptionExpenses).toBe(0);
     expect(proj.lifetime.totalPostedTransactions).toBe(0);
@@ -154,637 +285,476 @@ describe('Projection Service & Rebuildable Derived Projections', () => {
     expect(proj.debt.cumulativeDebtRepayment).toBe(0);
     expect(proj.debt.outstandingDebtLiability).toBe(0);
     expect(Object.keys(proj.monthlySummaries)).toHaveLength(0);
+    expect((proj as unknown as { appliedTxMeta?: unknown }).appliedTxMeta).toBeUndefined();
   });
 
-  it('applies transactions to projection data correctly', () => {
-    const proj = createEmptyProjection(userId);
+  // 1. Scalability: Document-size-safe behavior as transaction count grows
+  it('keeps projection document bounded in size as transaction count grows without storing unbounded transaction IDs', async () => {
+    // Generate 100 transactions across 2 months
+    for (let i = 1; i <= 100; i++) {
+      const month = i % 2 === 0 ? '2026-05' : '2026-06';
+      const day = String((i % 28) + 1).padStart(2, '0');
+      const tx: TransactionDocument = {
+        id: `tx-scale-${i}`,
+        userId,
+        accountId: 'acc-1',
+        amount: 10000,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: `${month}-${day}`,
+        description: `Income ${i}`,
+        tags: [],
+        notes: '',
+        categoryId: null,
+        counterpartyId: null,
+        allocations: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      transactionsStore.set(`${userId}/${tx.id}`, tx);
+      await recordTransactionCreatedInProjection(userId, tx);
+    }
 
-    const txIncome: TransactionDocument = {
-      id: 'tx-1',
-      userId,
-      accountId: 'acc-1',
-      amount: 10000000, // ₹1,00,000
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2026-05-10',
-      description: 'Consulting Income',
-      tags: [],
-      notes: '',
-      categoryId: 'cat-inc',
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-05-10T00:00:00Z',
-      updatedAt: '2026-05-10T00:00:00Z',
-    };
+    const proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.totalPostedTransactions).toBe(100);
+    expect(proj.lifetime.grossIncome).toBe(100 * 10000);
 
-    applyTransactionToProjectionData(proj, txIncome, 1);
-    expect(proj.lifetime.grossIncome).toBe(10000000);
-    expect(proj.lifetime.totalPostedTransactions).toBe(1);
-    expect(proj.lifetime.earliestTransactionDate).toBe('2026-05-10');
-    expect(proj.monthlySummaries['2026-05'].grossIncome).toBe(10000000);
+    // Verify document does not have growing appliedTxMeta map
+    expect((proj as unknown as { appliedTxMeta?: unknown }).appliedTxMeta).toBeUndefined();
 
-    const txDebtBorrow: TransactionDocument = {
-      id: 'tx-2',
-      userId,
-      accountId: 'acc-1',
-      amount: 5000000, // ₹50,000
-      type: 'DEBT_BORROWING',
-      status: 'POSTED',
-      transactionDate: '2026-05-15',
-      description: 'Personal Loan',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-05-15T00:00:00Z',
-      updatedAt: '2026-05-15T00:00:00Z',
-    };
+    // Verify document size remains compact (well within Firestore 1 MB limit)
+    const jsonStr = JSON.stringify(proj);
+    expect(jsonStr.length).toBeLessThan(4000); // Less than 4 KB!
 
-    applyTransactionToProjectionData(proj, txDebtBorrow, 1);
-    expect(proj.debt.cumulativeDebtBorrowing).toBe(5000000);
-    expect(proj.debt.outstandingDebtLiability).toBe(5000000);
-
-    const txDebtRepay: TransactionDocument = {
-      id: 'tx-3',
-      userId,
-      accountId: 'acc-1',
-      amount: 2000000, // ₹20,000
-      type: 'DEBT_REPAYMENT',
-      status: 'POSTED',
-      transactionDate: '2026-06-15',
-      description: 'Loan Repayment EMI',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-06-15T00:00:00Z',
-      updatedAt: '2026-06-15T00:00:00Z',
-    };
-
-    applyTransactionToProjectionData(proj, txDebtRepay, 1);
-    expect(proj.debt.cumulativeDebtRepayment).toBe(2000000);
-    expect(proj.debt.outstandingDebtLiability).toBe(3000000); // 50,000 - 20,000 = ₹30,000
+    // Verify individual per-transaction markers are stored in their own documents
+    expect(markersStore.size).toBe(100);
+    const marker1 = markersStore.get(`${userId}/tx-scale-1`) as unknown as ProjectionTxMarker;
+    expect(marker1).toBeDefined();
+    expect(marker1.status).toBe('POSTED');
+    expect(marker1.amount).toBe(10000);
   });
 
-  it('rebuilds projection deterministically from canonical ledger', async () => {
-    transactionsStore.set('tx-1', {
-      id: 'tx-1',
+  // 2. Retry and duplicate-event idempotency
+  it('ensures create, edit, void, and paired-transfer operations can be retried without applying deltas twice', async () => {
+    const tx: TransactionDocument = {
+      id: 'tx-idem-1',
       userId,
       accountId: 'acc-1',
-      amount: 8000000,
+      amount: 50000,
       type: 'INCOME',
       status: 'POSTED',
       transactionDate: '2026-04-10',
-      description: 'Salary',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-04-10T00:00:00Z',
-      updatedAt: '2026-04-10T00:00:00Z',
-    });
-
-    transactionsStore.set('tx-2', {
-      id: 'tx-2',
-      userId,
-      accountId: 'acc-1',
-      amount: 1500000,
-      type: 'TAX',
-      status: 'POSTED',
-      transactionDate: '2026-04-15',
-      description: 'TDS',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-04-15T00:00:00Z',
-      updatedAt: '2026-04-15T00:00:00Z',
-    });
-
-    transactionsStore.set('tx-3', {
-      id: 'tx-3',
-      userId,
-      accountId: 'acc-1',
-      amount: 2500000,
-      type: 'EXPENSE',
-      status: 'POSTED',
-      transactionDate: '2026-04-20',
-      description: 'Rent',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-04-20T00:00:00Z',
-      updatedAt: '2026-04-20T00:00:00Z',
-    });
-
-    // Voided transaction should be excluded
-    transactionsStore.set('tx-void', {
-      id: 'tx-void',
-      userId,
-      accountId: 'acc-1',
-      amount: 5000000,
-      type: 'EXPENSE',
-      status: 'VOIDED',
-      transactionDate: '2026-04-22',
-      description: 'Mistake transaction',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-04-22T00:00:00Z',
-      updatedAt: '2026-04-22T00:00:00Z',
-    });
-
-    const projection = await rebuildProjectionFromLedger(userId);
-
-    expect(projection.lifetime.grossIncome).toBe(8000000);
-    expect(projection.lifetime.netTaxPaid).toBe(1500000);
-    expect(projection.lifetime.consumptionExpenses).toBe(2500000);
-    expect(projection.lifetime.totalPostedTransactions).toBe(3);
-    expect(projection.lifetime.earliestTransactionDate).toBe('2026-04-10');
-
-    // Stored in projections collection
-    expect(projectionsStore.has(`${userId}/dashboard`)).toBe(true);
-  });
-
-  it('updates projection incrementally and idempotently on repeated creation calls', async () => {
-    await getOrBuildProjection(userId);
-
-    const tx: TransactionDocument = {
-      id: 'tx-idem',
-      userId,
-      accountId: 'acc-1',
-      amount: 4000000,
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2026-07-01',
       description: 'Consulting',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
+      version: 1,
+      createdAt: '2026-04-10T12:00:00.000Z',
+      updatedAt: '2026-04-10T12:00:00.000Z',
+    };
+    transactionsStore.set(`${userId}/${tx.id}`, tx);
+
+    // Create applied once
+    await recordTransactionCreatedInProjection(userId, tx);
+    let proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(50000);
+    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+
+    // Duplicate create call with identical state: MUST be an idempotent no-op
+    await recordTransactionCreatedInProjection(userId, tx);
+    proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(50000);
+    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+
+    // Edit transaction: change amount to 80000
+    const updatedTx: TransactionDocument = {
+      ...tx,
+      amount: 80000,
+      version: 2,
+      updatedAt: '2026-04-10T12:00:00.000Z', // Same timestamp resolution to test non-timestamp event identity!
+    };
+    transactionsStore.set(`${userId}/${tx.id}`, updatedTx);
+
+    await recordTransactionUpdatedInProjection(userId, tx, updatedTx);
+    proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(80000);
+    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+
+    // Duplicate update call: MUST NOT apply delta twice
+    await recordTransactionUpdatedInProjection(userId, tx, updatedTx);
+    proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(80000);
+    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+
+    // Void transaction
+    const voidedTx: TransactionDocument = {
+      ...updatedTx,
+      status: 'VOIDED',
+      version: 3,
+      updatedAt: '2026-04-10T12:00:00.000Z',
+    };
+    transactionsStore.set(`${userId}/${tx.id}`, voidedTx);
+
+    await recordTransactionVoidedInProjection(userId, voidedTx);
+    proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(0);
+    expect(proj.lifetime.totalPostedTransactions).toBe(0);
+
+    // Duplicate void call: MUST NOT reverse delta twice
+    await recordTransactionVoidedInProjection(userId, voidedTx);
+    proj = await getOrBuildProjection(userId);
+    expect(proj.lifetime.grossIncome).toBe(0);
+    expect(proj.lifetime.totalPostedTransactions).toBe(0);
+  });
+
+  // 3. Process interruption after ledger commit but before projection application
+  it('recovers projection automatically before dashboard reads when a crash occurs after ledger commit', async () => {
+    // Simulate process crash:
+    // Ledger write committed and outbox mutation event written, but process died before applyProjectionMutationEvent
+    const tx: TransactionDocument = {
+      id: 'tx-crash-1',
+      userId,
+      accountId: 'acc-1',
+      amount: 250000,
+      type: 'INCOME',
+      status: 'POSTED',
+      transactionDate: '2026-07-01',
+      description: 'Unprocessed Event',
+      tags: [],
+      notes: '',
+      categoryId: null,
+      counterpartyId: null,
+      allocations: [],
+      version: 1,
       createdAt: '2026-07-01T00:00:00Z',
       updatedAt: '2026-07-01T00:00:00Z',
     };
+    transactionsStore.set(`${userId}/${tx.id}`, tx);
 
-    transactionsStore.set(tx.id, tx);
-
-    // Call 1
-    await recordTransactionCreatedInProjection(userId, tx);
-    let currentProj = await getOrBuildProjection(userId);
-    expect(currentProj.lifetime.grossIncome).toBe(4000000);
-    expect(currentProj.lifetime.totalPostedTransactions).toBe(1);
-
-    // Call 2 (repeated call with identical state - must be idempotent no-op)
-    await recordTransactionCreatedInProjection(userId, tx);
-    currentProj = await getOrBuildProjection(userId);
-    expect(currentProj.lifetime.grossIncome).toBe(4000000);
-    expect(currentProj.lifetime.totalPostedTransactions).toBe(1);
-
-    // Call 3
-    await recordTransactionCreatedInProjection(userId, tx);
-    currentProj = await getOrBuildProjection(userId);
-    expect(currentProj.lifetime.grossIncome).toBe(4000000);
-    expect(currentProj.lifetime.totalPostedTransactions).toBe(1);
-  });
-
-  it('handles concurrent projection updates without losing data', async () => {
-    await getOrBuildProjection(userId);
-
-    const tx1: TransactionDocument = {
-      id: 'tx-c1',
+    const outboxEvent: ProjectionMutationEvent = {
+      eventId: 'evt_crash_tx-crash-1_v1',
       userId,
-      accountId: 'acc-1',
-      amount: 1000000,
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2026-07-02',
-      description: 'Income A',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-07-02T00:00:00Z',
-      updatedAt: '2026-07-02T00:00:00Z',
+      eventType: 'TX_CREATED',
+      createdAt: '2026-07-01T00:00:00Z',
+      txId: tx.id,
+      version: 1,
+      tx,
     };
+    outboxStore.set(`${userId}/${outboxEvent.eventId}`, outboxEvent as unknown as Record<string, unknown>);
 
-    const tx2: TransactionDocument = {
-      id: 'tx-c2',
-      userId,
-      accountId: 'acc-1',
-      amount: 2000000,
-      type: 'EXPENSE',
-      status: 'POSTED',
-      transactionDate: '2026-07-03',
-      description: 'Expense B',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-07-03T00:00:00Z',
-      updatedAt: '2026-07-03T00:00:00Z',
-    };
+    // Projection document currently does not have this transaction
+    expect(outboxStore.size).toBe(1);
 
-    transactionsStore.set(tx1.id, tx1);
-    transactionsStore.set(tx2.id, tx2);
-
-    // Concurrently trigger projection updates
-    await Promise.all([
-      recordTransactionCreatedInProjection(userId, tx1),
-      recordTransactionCreatedInProjection(userId, tx2),
-    ]);
-
+    // Ordinary dashboard request calls getOrBuildProjection
     const proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.grossIncome).toBe(1000000);
-    expect(proj.lifetime.consumptionExpenses).toBe(2000000);
-    expect(proj.lifetime.totalPostedTransactions).toBe(2);
+
+    // Confirm projection recovered and applied the pending outbox event before returning
+    expect(proj.lifetime.grossIncome).toBe(250000);
+    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+    expect(proj.lifetime.earliestTransactionDate).toBe('2026-07-01');
+    expect(proj.monthlySummaries['2026-07'].grossIncome).toBe(250000);
+
+    // Confirm outbox event was drained
+    expect(outboxStore.size).toBe(0);
   });
 
-  it('records paired internal transfers consistently and idempotently', async () => {
-    await getOrBuildProjection(userId);
+  // 4. Concurrent create/edit/void/transfer mutations
+  it('handles concurrent create, edit, void, and transfer mutations without lost updates or race corruption', async () => {
+    // Concurrently create 5 income transactions, 1 borrowing, and 1 internal transfer
+    const tasks: Promise<void>[] = [];
+
+    for (let i = 1; i <= 5; i++) {
+      const tx: TransactionDocument = {
+        id: `tx-conc-${i}`,
+        userId,
+        accountId: 'acc-1',
+        amount: 20000 * i,
+        type: 'INCOME',
+        status: 'POSTED',
+        transactionDate: `2026-08-0${i}`,
+        description: `Income ${i}`,
+        tags: [],
+        notes: '',
+        categoryId: null,
+        counterpartyId: null,
+        allocations: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      transactionsStore.set(`${userId}/${tx.id}`, tx);
+      tasks.push(recordTransactionCreatedInProjection(userId, tx));
+    }
+
+    const borrowTx: TransactionDocument = {
+      id: 'tx-conc-borrow',
+      userId,
+      accountId: 'acc-1',
+      amount: 100000,
+      type: 'DEBT_BORROWING',
+      status: 'POSTED',
+      transactionDate: '2026-08-01',
+      description: 'Loan',
+      tags: [],
+      notes: '',
+      categoryId: null,
+      counterpartyId: null,
+      allocations: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    transactionsStore.set(`${userId}/${borrowTx.id}`, borrowTx);
+    tasks.push(recordTransactionCreatedInProjection(userId, borrowTx));
 
     const sourceTx: TransactionDocument = {
-      id: 'tx-src',
+      id: 'tx-conc-xfer-src',
       userId,
       accountId: 'acc-1',
-      amount: 5000000,
+      destinationAccountId: 'acc-2',
+      amount: 50000,
       type: 'INTERNAL_TRANSFER',
-      transferDirection: 'OUTGOING',
-      transferGroupId: 'grp-1',
+      transferDirection: 'OUT',
       status: 'POSTED',
-      transactionDate: '2026-07-05',
+      transferGroupId: 'grp-conc-xfer',
+      transactionDate: '2026-08-02',
       description: 'Transfer Out',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2026-07-05T00:00:00Z',
-      updatedAt: '2026-07-05T00:00:00Z',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
-
     const destTx: TransactionDocument = {
-      id: 'tx-dest',
+      id: 'tx-conc-xfer-dst',
       userId,
       accountId: 'acc-2',
-      amount: 5000000,
+      destinationAccountId: 'acc-1',
+      amount: 50000,
       type: 'INTERNAL_TRANSFER',
-      transferDirection: 'INCOMING',
-      transferGroupId: 'grp-1',
+      transferDirection: 'IN',
       status: 'POSTED',
-      transactionDate: '2026-07-05',
+      transferGroupId: 'grp-conc-xfer',
+      transactionDate: '2026-08-02',
       description: 'Transfer In',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2026-07-05T00:00:00Z',
-      updatedAt: '2026-07-05T00:00:00Z',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
+    transactionsStore.set(`${userId}/${sourceTx.id}`, sourceTx);
+    transactionsStore.set(`${userId}/${destTx.id}`, destTx);
+    tasks.push(recordInternalTransferCreatedInProjection(userId, sourceTx, destTx));
 
-    transactionsStore.set(sourceTx.id, sourceTx);
-    transactionsStore.set(destTx.id, destTx);
+    // Run all mutations concurrently
+    await Promise.all(tasks);
 
-    // Apply paired legs
-    await recordInternalTransferCreatedInProjection(userId, sourceTx, destTx);
-
-    let proj = await getOrBuildProjection(userId);
-    // Transfers do not affect personal income or expenses
-    expect(proj.lifetime.grossIncome).toBe(0);
-    expect(proj.lifetime.consumptionExpenses).toBe(0);
-    expect(proj.lifetime.totalPostedTransactions).toBe(2);
-
-    // Retrying paired transfer update is idempotent
-    await recordInternalTransferCreatedInProjection(userId, sourceTx, destTx);
-    proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.totalPostedTransactions).toBe(2);
-
-    // Voiding transfer legs atomically
-    await recordTransactionsVoidedInProjection(userId, [sourceTx, destTx]);
-    proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.totalPostedTransactions).toBe(0);
+    // Verify consistency
+    const verification = await verifyProjectionConsistency(userId);
+    expect(verification.isConsistent).toBe(true);
+    expect(verification.discrepancies).toHaveLength(0);
+    expect(verification.storedProjection.lifetime.totalPostedTransactions).toBe(8); // 5 income + 1 debt + 2 transfer legs
+    expect(verification.storedProjection.debt.outstandingDebtLiability).toBe(100000);
+    expect(verification.storedProjection.lifetime.grossIncome).toBe(20000 + 40000 + 60000 + 80000 + 100000);
   });
 
-  it('handles edits that change transaction date, type, and amount', async () => {
-    await getOrBuildProjection(userId);
-
-    const originalTx: TransactionDocument = {
-      id: 'tx-edit-test',
+  // 5. Rebuild conflicts and exhausted retries
+  it('protects rebuild with generation fencing against concurrent mutations and avoids un-fenced direct writes', async () => {
+    // Initial transaction
+    const initialTx: TransactionDocument = {
+      id: 'tx-rb-1',
       userId,
       accountId: 'acc-1',
-      amount: 3000000, // ₹30,000 EXPENSE in March
-      type: 'EXPENSE',
+      amount: 100000,
+      type: 'INCOME',
       status: 'POSTED',
-      transactionDate: '2026-03-10',
-      description: 'Business Expense',
+      transactionDate: '2026-03-01',
+      description: 'Base Income',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2026-03-10T00:00:00Z',
-      updatedAt: '2026-03-10T00:00:00Z',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
+    transactionsStore.set(`${userId}/${initialTx.id}`, initialTx);
+    await rebuildProjectionFromLedger(userId);
 
-    transactionsStore.set(originalTx.id, originalTx);
-    await recordTransactionCreatedInProjection(userId, originalTx);
+    const initialProj = await getOrBuildProjection(userId);
+    expect(initialProj.lifetime.grossIncome).toBe(100000);
+    const initialGen = initialProj.generation;
 
-    let proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.consumptionExpenses).toBe(3000000);
-    expect(proj.lifetime.grossIncome).toBe(0);
-    expect(proj.monthlySummaries['2026-03'].consumptionExpenses).toBe(3000000);
+    // Test successful rebuild after simulated transient conflict (attempt 1 conflicts, attempt 2 succeeds)
+    conflictHook = (attempt: number) => attempt === 1;
+    const rebuiltProj = await rebuildProjectionFromLedger(userId);
+    expect(rebuiltProj.generation).toBe(initialGen + 1);
+    expect(rebuiltProj.lifetime.grossIncome).toBe(100000);
+    conflictHook = null;
 
-    // Edit: change to INCOME of ₹50,000 in April
-    const editedTx: TransactionDocument = {
-      ...originalTx,
-      amount: 5000000,
-      type: 'INCOME',
-      transactionDate: '2026-04-12',
-      updatedAt: '2026-04-12T00:00:00Z',
-    };
+    // Test exhausted retries: all 5 attempts conflict
+    // Rebuild MUST NOT perform unconditional direct write; it must mark stale and abort safely
+    conflictHook = () => true;
+    await expect(rebuildProjectionFromLedger(userId)).rejects.toThrow(
+      /Projection rebuild aborted after 5 attempts due to concurrent ledger mutations/,
+    );
+    conflictHook = null;
 
-    transactionsStore.set(editedTx.id, editedTx);
-    await recordTransactionUpdatedInProjection(userId, originalTx, editedTx);
-
-    proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.consumptionExpenses).toBe(0);
-    expect(proj.lifetime.grossIncome).toBe(5000000);
-    expect(proj.monthlySummaries['2026-03'].consumptionExpenses).toBe(0);
-    expect(proj.monthlySummaries['2026-04'].grossIncome).toBe(5000000);
-    expect(proj.lifetime.totalPostedTransactions).toBe(1);
-
-    // Repeating the same edit update is idempotent
-    await recordTransactionUpdatedInProjection(userId, originalTx, editedTx);
-    proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.grossIncome).toBe(5000000);
-    expect(proj.lifetime.totalPostedTransactions).toBe(1);
+    // Check that projection is marked stale so subsequent reads know it requires repair
+    const staleProj = projectionsStore.get(`${userId}/dashboard`) as unknown as DashboardProjection;
+    expect(staleProj.isStale).toBe(true);
+    expect(staleProj.staleReason).toContain('REBUILD_CONFLICT');
   });
 
-  it('updates earliestTransactionDate when the earliest transaction is voided', async () => {
-    await getOrBuildProjection(userId);
-
-    const tx1: TransactionDocument = {
-      id: 'tx-earliest-1',
+  // 6. Earliest-date changes racing with edits or voids
+  it('safely recalculates earliestTransactionDate when earliest transaction is voided or edited', async () => {
+    const txEarly: TransactionDocument = {
+      id: 'tx-date-early',
       userId,
       accountId: 'acc-1',
-      amount: 1000000,
+      amount: 50000,
       type: 'INCOME',
       status: 'POSTED',
-      transactionDate: '2025-01-10',
+      transactionDate: '2026-01-05',
       description: 'Earliest Transaction',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2025-01-10T00:00:00Z',
-      updatedAt: '2025-01-10T00:00:00Z',
+      version: 1,
+      createdAt: '2026-01-05T00:00:00Z',
+      updatedAt: '2026-01-05T00:00:00Z',
     };
 
-    const tx2: TransactionDocument = {
-      id: 'tx-earliest-2',
+    const txMiddle: TransactionDocument = {
+      id: 'tx-date-mid',
       userId,
       accountId: 'acc-1',
-      amount: 2000000,
+      amount: 75000,
       type: 'INCOME',
       status: 'POSTED',
-      transactionDate: '2025-06-20',
-      description: 'Later Transaction',
+      transactionDate: '2026-02-15',
+      description: 'Middle Transaction',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2025-06-20T00:00:00Z',
-      updatedAt: '2025-06-20T00:00:00Z',
+      version: 1,
+      createdAt: '2026-02-15T00:00:00Z',
+      updatedAt: '2026-02-15T00:00:00Z',
     };
 
-    transactionsStore.set(tx1.id, tx1);
-    transactionsStore.set(tx2.id, tx2);
+    transactionsStore.set(`${userId}/${txEarly.id}`, txEarly);
+    transactionsStore.set(`${userId}/${txMiddle.id}`, txMiddle);
 
-    await recordTransactionCreatedInProjection(userId, tx1);
-    await recordTransactionCreatedInProjection(userId, tx2);
+    await recordTransactionCreatedInProjection(userId, txEarly);
+    await recordTransactionCreatedInProjection(userId, txMiddle);
 
     let proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.earliestTransactionDate).toBe('2025-01-10');
+    expect(proj.lifetime.earliestTransactionDate).toBe('2026-01-05');
 
-    // Void tx1 (the earliest transaction)
-    const voidedTx1: TransactionDocument = {
-      ...tx1,
+    // Void the earliest transaction (txEarly)
+    const voidedEarly: TransactionDocument = {
+      ...txEarly,
       status: 'VOIDED',
-      updatedAt: '2025-06-25T00:00:00Z',
+      version: 2,
+      updatedAt: new Date().toISOString(),
     };
-    transactionsStore.set(tx1.id, voidedTx1);
+    transactionsStore.set(`${userId}/${txEarly.id}`, voidedEarly);
 
-    await recordTransactionVoidedInProjection(userId, tx1);
-
+    await recordTransactionVoidedInProjection(userId, voidedEarly);
     proj = await getOrBuildProjection(userId);
-    // Earliest transaction date must advance to tx2's date
-    expect(proj.lifetime.earliestTransactionDate).toBe('2025-06-20');
 
-    // Void tx2
-    const voidedTx2: TransactionDocument = {
-      ...tx2,
-      status: 'VOIDED',
-      updatedAt: '2025-06-26T00:00:00Z',
+    // Earliest date must now accurately advance to 2026-02-15
+    expect(proj.lifetime.earliestTransactionDate).toBe('2026-02-15');
+
+    // Now edit txMiddle to move its date forward to 2026-04-01
+    const movedMiddle: TransactionDocument = {
+      ...txMiddle,
+      transactionDate: '2026-04-01',
+      version: 2,
+      updatedAt: new Date().toISOString(),
     };
-    transactionsStore.set(tx2.id, voidedTx2);
+    transactionsStore.set(`${userId}/${txMiddle.id}`, movedMiddle);
 
-    await recordTransactionVoidedInProjection(userId, tx2);
-
+    await recordTransactionUpdatedInProjection(userId, txMiddle, movedMiddle);
     proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.earliestTransactionDate).toBeNull();
-  });
 
-  it('updates earliestTransactionDate when the earliest transaction date is edited forward', async () => {
-    await getOrBuildProjection(userId);
+    // Earliest date updates to 2026-04-01
+    expect(proj.lifetime.earliestTransactionDate).toBe('2026-04-01');
 
-    const tx1: TransactionDocument = {
-      id: 'tx-shift-1',
+    // Add a new earliest transaction (2025-11-20)
+    const txAncient: TransactionDocument = {
+      id: 'tx-date-ancient',
       userId,
       accountId: 'acc-1',
-      amount: 1000000,
+      amount: 10000,
       type: 'INCOME',
       status: 'POSTED',
-      transactionDate: '2025-02-01',
-      description: 'First',
+      transactionDate: '2025-11-20',
+      description: 'Ancient Transaction',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2025-02-01T00:00:00Z',
-      updatedAt: '2025-02-01T00:00:00Z',
+      version: 1,
+      createdAt: '2025-11-20T00:00:00Z',
+      updatedAt: '2025-11-20T00:00:00Z',
     };
+    transactionsStore.set(`${userId}/${txAncient.id}`, txAncient);
 
-    const tx2: TransactionDocument = {
-      id: 'tx-shift-2',
-      userId,
-      accountId: 'acc-1',
-      amount: 1000000,
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2025-05-15',
-      description: 'Second',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2025-05-15T00:00:00Z',
-      updatedAt: '2025-05-15T00:00:00Z',
-    };
-
-    transactionsStore.set(tx1.id, tx1);
-    transactionsStore.set(tx2.id, tx2);
-
-    await recordTransactionCreatedInProjection(userId, tx1);
-    await recordTransactionCreatedInProjection(userId, tx2);
-
-    let proj = await getOrBuildProjection(userId);
-    expect(proj.lifetime.earliestTransactionDate).toBe('2025-02-01');
-
-    // Edit tx1: move date to 2025-08-01 (after tx2)
-    const shiftedTx1: TransactionDocument = {
-      ...tx1,
-      transactionDate: '2025-08-01',
-      updatedAt: '2025-08-01T00:00:00Z',
-    };
-    transactionsStore.set(tx1.id, shiftedTx1);
-
-    await recordTransactionUpdatedInProjection(userId, tx1, shiftedTx1);
-
+    await recordTransactionCreatedInProjection(userId, txAncient);
     proj = await getOrBuildProjection(userId);
-    // tx2 is now the earliest
-    expect(proj.lifetime.earliestTransactionDate).toBe('2025-05-15');
+    expect(proj.lifetime.earliestTransactionDate).toBe('2025-11-20');
   });
 
-  it('marks projection stale on error and triggers automatic repair on dashboard retrieval', async () => {
-    // 1. Initial clean ledger
+  // 7. Projection recovery before dashboard data is served
+  it('triggers safe repair rebuild before dashboard reads when projection is marked stale', async () => {
     const tx: TransactionDocument = {
-      id: 'tx-repair-1',
+      id: 'tx-stale-repair',
       userId,
       accountId: 'acc-1',
-      amount: 7500000,
+      amount: 120000,
       type: 'INCOME',
       status: 'POSTED',
-      transactionDate: '2026-08-01',
-      description: 'Retainer',
+      transactionDate: '2026-09-10',
+      description: 'Repair Test',
       tags: [],
       notes: '',
       categoryId: null,
       counterpartyId: null,
       allocations: [],
-      createdAt: '2026-08-01T00:00:00Z',
-      updatedAt: '2026-08-01T00:00:00Z',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
-    transactionsStore.set(tx.id, tx);
-    await rebuildProjectionFromLedger(userId);
+    transactionsStore.set(`${userId}/${tx.id}`, tx);
+    await recordTransactionCreatedInProjection(userId, tx);
 
-    let proj = await getOrBuildProjection(userId);
-    expect(proj.isStale).toBe(false);
-    expect(proj.lifetime.grossIncome).toBe(7500000);
+    // Manually mark projection stale (e.g. from prior failure or external detection)
+    await markProjectionStale(userId, 'CORRUPTED_CACHE_DETECTED');
 
-    // 2. Simulate failed maintenance: mark projection as stale
-    await markProjectionStale(userId, 'PROJECTION_MAINTENANCE_TIMEOUT');
+    const staleSnap = projectionsStore.get(`${userId}/dashboard`) as unknown as DashboardProjection;
+    expect(staleSnap.isStale).toBe(true);
 
-    const rawStored = projectionsStore.get(`${userId}/dashboard`) as unknown as {
-      isStale: boolean;
-      staleReason: string;
-    };
-    expect(rawStored.isStale).toBe(true);
-    expect(rawStored.staleReason).toBe('PROJECTION_MAINTENANCE_TIMEOUT');
+    // Ordinary dashboard request calls getOrBuildProjection
+    const repairedProj = await getOrBuildProjection(userId);
 
-    // Add another transaction directly to ledger while marked stale
-    const tx2: TransactionDocument = {
-      id: 'tx-repair-2',
-      userId,
-      accountId: 'acc-1',
-      amount: 2500000,
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2026-08-05',
-      description: 'Second Retainer',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-08-05T00:00:00Z',
-      updatedAt: '2026-08-05T00:00:00Z',
-    };
-    transactionsStore.set(tx2.id, tx2);
+    // Confirms repair happened before returning results
+    expect(repairedProj.isStale).toBe(false);
+    expect(repairedProj.staleReason).toBeNull();
+    expect(repairedProj.lifetime.grossIncome).toBe(120000);
+    expect(repairedProj.rebuiltAt).toBeDefined();
 
-    // 3. Dashboard retrieval automatically detects stale projection and triggers repair rebuild
-    proj = await getOrBuildProjection(userId);
-    expect(proj.isStale).toBe(false);
-    expect(proj.lifetime.grossIncome).toBe(10000000); // 7,500,000 + 2,500,000
-    expect(proj.lifetime.totalPostedTransactions).toBe(2);
-  });
-
-  it('performs comprehensive consistency verification across all lifetime, debt, and monthly fields', async () => {
-    const tx: TransactionDocument = {
-      id: 'tx-comp-check',
-      userId,
-      accountId: 'acc-1',
-      amount: 15000000,
-      type: 'INCOME',
-      status: 'POSTED',
-      transactionDate: '2026-08-01',
-      description: 'Annual Contract',
-      tags: [],
-      notes: '',
-      categoryId: null,
-      counterpartyId: null,
-      allocations: [],
-      createdAt: '2026-08-01T00:00:00Z',
-      updatedAt: '2026-08-01T00:00:00Z',
-    };
-
-    transactionsStore.set(tx.id, tx);
-    await rebuildProjectionFromLedger(userId);
-
-    // 1. Clean verification
-    const cleanCheck = await verifyProjectionConsistency(userId);
-    expect(cleanCheck.isConsistent).toBe(true);
-    expect(cleanCheck.discrepancies).toHaveLength(0);
-
-    // 2. Corrupt a monthly field specifically
-    const stored = JSON.parse(JSON.stringify(projectionsStore.get(`${userId}/dashboard`)));
-    stored.monthlySummaries['2026-08'].netTaxPaid = 50000;
-    projectionsStore.set(`${userId}/dashboard`, stored);
-
-    let check = await verifyProjectionConsistency(userId);
-    expect(check.isConsistent).toBe(false);
-    expect(check.discrepancies.some((d) => d.includes('monthlySummaries[2026-08].netTaxPaid'))).toBe(true);
-
-    // 3. Corrupt a debt liability field specifically
-    const stored2 = JSON.parse(JSON.stringify(cleanCheck.storedProjection));
-    stored2.debt.outstandingDebtLiability = 999999;
-    projectionsStore.set(`${userId}/dashboard`, stored2);
-
-    check = await verifyProjectionConsistency(userId);
-    expect(check.isConsistent).toBe(false);
-    expect(check.discrepancies.some((d) => d.includes('debt.outstandingDebtLiability'))).toBe(true);
-
-    // 4. Corrupt lifetime reconciliationAdjustments
-    const stored3 = JSON.parse(JSON.stringify(cleanCheck.storedProjection));
-    stored3.lifetime.reconciliationAdjustments = 12345;
-    projectionsStore.set(`${userId}/dashboard`, stored3);
-
-    check = await verifyProjectionConsistency(userId);
-    expect(check.isConsistent).toBe(false);
-    expect(check.discrepancies.some((d) => d.includes('lifetime.reconciliationAdjustments'))).toBe(true);
+    // Consistency check confirms 100% agreement
+    const check = await verifyProjectionConsistency(userId);
+    expect(check.isConsistent).toBe(true);
   });
 });

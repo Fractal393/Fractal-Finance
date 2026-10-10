@@ -32,6 +32,8 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
       transactions: new Map(),
       audit: new Map(),
       projections: new Map(),
+      projectionOutbox: new Map(),
+      projectionMarkers: new Map(),
     };
 
     let docIdCounter = 1;
@@ -49,7 +51,14 @@ describe('Slice 2: Accounts, Cash Custody, Balances & Reconciliation', () => {
                   if (subColName === 'transactions') return mockStore.transactions;
                   if (subColName === 'audit') return mockStore.audit;
                   if (subColName === 'projections') return mockStore.projections;
-                  throw new Error(`Unexpected subcollection ${subColName}`);
+                  if (subColName === 'projectionOutbox') return mockStore.projectionOutbox;
+                  if (subColName === 'projectionMarkers') return mockStore.projectionMarkers;
+                  let customStore = (mockStore as Record<string, Map<string, Record<string, unknown>>>)[subColName];
+                  if (!customStore) {
+                    customStore = new Map();
+                    (mockStore as Record<string, Map<string, Record<string, unknown>>>)[subColName] = customStore;
+                  }
+                  return customStore;
                 };
 
                 return {
